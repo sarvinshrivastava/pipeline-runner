@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pipeline Runner</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><text y=%2213%22 font-size=%2213%22>&#9201;</text></svg>">
+</head>
+<body>
+  <header>
+    <h1>Pipeline Runner</h1>
+    <div class="header-actions">
+      <span id="health" class="pill pill-muted">checking…</span>
+      <button id="new-btn" class="btn btn-primary">New pipeline</button>
+      <button id="signout-btn" class="btn btn-ghost" hidden>Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="auth-gate" hidden>
+      <div class="card narrow">
+        <h2>API token</h2>
+        <p class="muted">Stored in this browser only, and sent as a bearer token.</p>
+        <form id="token-form">
+          <input id="token-input" type="password" placeholder="API token" autocomplete="current-password" required>
+          <button class="btn btn-primary" type="submit">Continue</button>
+        </form>
+        <p id="token-error" class="error" hidden></p>
+      </div>
+    </section>
+
+    <section id="app" hidden>
+      <div id="pipelines"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Recent runs</h2>
+          <select id="run-filter">
+            <option value="">All pipelines</option>
+          </select>
+        </div>
+        <div id="runs"></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="form-dialog">
+    <form id="pipeline-form" method="dialog">
+      <h2 id="form-title">New pipeline</h2>
+      <div class="grid">
+        <label>Name<input name="name" required placeholder="my-pipeline" pattern="[a-z0-9][a-z0-9-]*"></label>
+        <label>Image<input name="image" required placeholder="python:3.12"></label>
+        <label class="span2">Repo URL<input name="repo_url" required placeholder="https://github.com/owner/repo.git"></label>
+        <label>Branch<input name="branch" value="main"></label>
+        <label>Output branch<input name="output_branch" placeholder="(same as branch)"></label>
+        <label class="span2">Command<textarea name="command" required rows="3" placeholder="python fetch.py"></textarea></label>
+        <label>Cron<input name="cron" required placeholder="*/15 * * * *"></label>
+        <label>Timezone<input name="timezone" value="UTC" placeholder="Asia/Kolkata"></label>
+        <label>Timeout (s)<input name="timeout_sec" type="number" value="900" min="1"></label>
+        <label>Max late (s)<input name="max_late_sec" type="number" value="600" min="0"></label>
+        <label>Warn if late (s)<input name="late_warn_sec" type="number" value="60" min="0"></label>
+        <label>Memory (MB)<input name="memory_mb" type="number" value="512" min="16"></label>
+        <label>CPUs<input name="cpus" type="number" value="1" step="0.1" min="0.1"></label>
+        <label>Overlap<select name="overlap_policy"><option value="skip">skip</option><option value="queue">queue</option></select></label>
+        <label class="span2">Env (KEY=value per line, encrypted at rest)<textarea name="env" rows="3" placeholder="API_KEY=…"></textarea></label>
+        <label class="check"><input name="commit_results" type="checkbox" checked> Commit results back to git</label>
+        <label class="check"><input name="idempotent" type="checkbox" checked> Safe to retry automatically</label>
+        <label class="check"><input name="notify_on_success" type="checkbox"> Notify on success</label>
+        <label class="check"><input name="enabled" type="checkbox" checked> Enabled</label>
+      </div>
+      <p id="form-error" class="error" hidden></p>
+      <div class="actions">
+        <button type="button" id="form-cancel" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="form-save" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="log-dialog">
+    <div class="log-head">
+      <h2 id="log-title">Logs</h2>
+      <button type="button" id="log-close" class="btn btn-ghost">Close</button>
+    </div>
+    <pre id="log-body">…</pre>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

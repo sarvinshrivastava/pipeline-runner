@@ -1,0 +1,42 @@
+services:
+  app:
+    build: .
+    container_name: ${SERVICE_NAME:-pipeline-runner}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - PORT=3000
+      - SERVICE_NAME=${SERVICE_NAME:-pipeline-runner}
+      - DATA_DIR=${HOST_DATA_DIR:-/root/pipeline-runner-data}
+
+    volumes:
+      # Bind mount using the SAME path inside and outside the container.
+      # `docker run -v` args we generate are resolved by the HOST daemon, so a
+      # workspace path must be valid on the host as well as in here. A named
+      # volume would break this.
+      - ${HOST_DATA_DIR:-/root/pipeline-runner-data}:${HOST_DATA_DIR:-/root/pipeline-runner-data}
+      # Highest-privilege mount in this file: full Docker API access is
+      # equivalent to host root. Every route is therefore token-gated, and
+      # pipelines may only supply an image + command, never docker flags.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    labels:
+      autoheal: "true"
+
+    healthcheck:
+      # A scheduler cannot page about its own death; /healthz 503s once the
+      # tick loop stalls, which is what makes the failure externally visible.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

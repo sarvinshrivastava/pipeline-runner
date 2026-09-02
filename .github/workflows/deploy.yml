@@ -1,0 +1,43 @@
+name: deploy
+
+# Manual only, matching every other service on the box: a stray push must never
+# trigger a live deploy.
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch VPS credentials from the secrets manager
+        id: creds
+        run: |
+          set -euo pipefail
+          EXPORTS=$(curl -sf -H "X-API-Key: ${{ secrets.SM_READ_TOKEN }}" \
+            "${{ secrets.SM_URL }}/api/exports")
+          echo "::add-mask::$(echo "$EXPORTS" | grep '^VPS_SSH_KEY=' | cut -d= -f2-)"
+          {
+            echo "host<<EOF"
+            echo "$EXPORTS" | grep '^VPS_HOST=' | cut -d= -f2-
+            echo "EOF"
+            echo "key<<EOF"
+            echo "$EXPORTS" | grep '^VPS_SSH_KEY=' | cut -d= -f2-
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ steps.creds.outputs.host }}
+          username: root
+          key: ${{ steps.creds.outputs.key }}
+          script: |
+            set -euo pipefail
+            REPO_NAME=$(basename "${{ github.repository }}")
+            APP_DIR="/root/apps/$REPO_NAME"
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone "${{ github.server_url }}/${{ github.repository }}.git" "$APP_DIR"
+            else
+              git -C "$APP_DIR" pull origin main
+            fi
+            vps-deploy "$REPO_NAME" "$APP_DIR"
