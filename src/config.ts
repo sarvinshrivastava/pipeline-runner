@@ -13,6 +13,16 @@ function env(name: string, fallback = ""): string {
   return v === undefined || v.trim() === "" ? fallback : v.trim();
 }
 
+/**
+ * Tolerates a bare host ("ntfy.sh") where a URL is meant. Without a scheme
+ * fetch() throws, and a status channel that silently cannot publish is exactly
+ * the failure mode this service exists to avoid.
+ */
+function envUrl(name: string, fallback: string): string {
+  const v = env(name, fallback);
+  return /^https?:\/\//i.test(v) ? v : `https://${v}`;
+}
+
 function envInt(name: string, fallback: number): number {
   const raw = env(name);
   if (!raw) return fallback;
@@ -54,7 +64,7 @@ export const config = {
   /** A READ token is sufficient - the runner never writes secrets. */
   SECRET_MANAGER_TOKEN: env("SECRET_MANAGER_TOKEN"),
 
-  NTFY_BASE: env("NTFY_BASE", "https://ntfy.sh"),
+  NTFY_BASE: envUrl("NTFY_BASE", "https://ntfy.sh"),
   NTFY_TOPIC_OK: env("NTFY_TOPIC_OK"),
   NTFY_TOPIC_FAIL: env("NTFY_TOPIC_FAIL"),
   NTFY_TOKEN: env("NTFY_TOKEN"),
