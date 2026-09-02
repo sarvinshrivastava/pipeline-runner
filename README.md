@@ -2,6 +2,10 @@
 
 Scheduled data pipelines that actually run when they say they will.
 
+**Day-to-day usage — subscribing to alerts, adding a cron, cron syntax,
+troubleshooting — is in [USAGE.md](USAGE.md).** This file covers design and
+operation.
+
 Register a pipeline over the API: a git repo, a container image, a command, and
 a cron expression. The runner clones the repo, runs your script in a throwaway
 container at the scheduled moment, commits whatever the script wrote back to a
