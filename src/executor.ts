@@ -14,6 +14,7 @@ import { commitAndPush, gitTokenFor, outputBranchOf, syncWorkspace, workspacePat
 import { LogSink } from "./lib/logsink.ts";
 import { notifyPipeline } from "./lib/ntfy.ts";
 import { run as spawnProc, redact } from "./lib/proc.ts";
+import { resolveRefs } from "./secretsmanager.ts";
 import { getRun, updateRun, type Pipeline, type Run, type RunStatus } from "./db.ts";
 
 export function containerNameFor(runId: string): string {
@@ -87,7 +88,17 @@ export async function executeRun(
   let secrets: string[] = [];
 
   try {
-    const pipelineEnv = decryptEnv(pipeline.encrypted_env);
+    // Referenced secrets are fetched fresh from the vault every run, so a
+    // rotated credential takes effect immediately with no pipeline edit. A
+    // reference that has since been deleted throws here and fails the run
+    // loudly - never start a run with a silently-absent credential.
+    const storedEnv = decryptEnv(pipeline.encrypted_env);
+    const refs = JSON.parse(pipeline.secret_refs || "{}") as Record<string, string>;
+    const refNames = Object.keys(refs);
+    if (refNames.length) {
+      sink.writeText(`resolving ${refNames.length} secret reference(s): ${refNames.join(", ")}\n`);
+    }
+    const pipelineEnv = { ...storedEnv, ...(await resolveRefs(refs)) };
     const token = gitTokenFor(pipelineEnv);
     secrets = [token, ...Object.values(pipelineEnv)].filter(Boolean);
 

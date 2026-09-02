@@ -43,6 +43,17 @@ export const config = {
   GIT_AUTHOR_NAME: env("GIT_AUTHOR_NAME", "pipeline-runner"),
   GIT_AUTHOR_EMAIL: env("GIT_AUTHOR_EMAIL", "pipeline-runner@vps.local"),
 
+  /**
+   * secret-manager publishes only on 127.0.0.1:8000 of the HOST, which a
+   * container cannot reach via host-gateway. We instead join its docker
+   * network at boot and address it by container name. See
+   * ensureSecretManagerNetwork().
+   */
+  SECRET_MANAGER_URL: env("SECRET_MANAGER_URL", "http://secret-manager:8000"),
+  SECRET_MANAGER_CONTAINER: env("SECRET_MANAGER_CONTAINER", "secret-manager"),
+  /** A READ token is sufficient - the runner never writes secrets. */
+  SECRET_MANAGER_TOKEN: env("SECRET_MANAGER_TOKEN"),
+
   NTFY_BASE: env("NTFY_BASE", "https://ntfy.sh"),
   NTFY_TOPIC_OK: env("NTFY_TOPIC_OK"),
   NTFY_TOPIC_FAIL: env("NTFY_TOPIC_FAIL"),

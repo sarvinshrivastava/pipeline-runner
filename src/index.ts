@@ -6,10 +6,15 @@
 import { assertConfig, config } from "./config.ts";
 import { openDb } from "./db.ts";
 import { startScheduler } from "./scheduler.ts";
+import { ensureSecretManagerNetwork } from "./secretsmanager.ts";
 import { startServer } from "./server.ts";
 
 assertConfig();
 openDb();
+
+// Best-effort: without it, secret references cannot resolve, but pipelines
+// that use none still run fine. Failure is logged, not fatal.
+await ensureSecretManagerNetwork();
 
 const stopScheduler = await startScheduler();
 const server = startServer();

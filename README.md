@@ -77,7 +77,60 @@ Secrets live in the secrets manager under the `PIPELINE_RUNNER_` prefix;
 > `??`.
 
 A pipeline may override the git credential by setting `GIT_TOKEN` in its own
-env; that key is consumed for auth and stripped before the container starts.
+env or secret refs; that key is consumed for auth and stripped before the
+container starts.
+
+## Secret references
+
+A pipeline does not have to store credentials itself. It can **reference** a key
+in the secrets manager, and the value is fetched fresh at run time:
+
+```json
+{
+  "secret_refs": {
+    "GIT_TOKEN": "Root/PIPELINE_RUNNER_GITHUB_TOKEN",
+    "WEATHER_API_KEY": "Root/MY_WEATHER_KEY"
+  }
+}
+```
+
+The value maps to the env var on the left. A bare `"MY_KEY"` is shorthand for
+`"Root/MY_KEY"`.
+
+Why references beat storing the value:
+
+- **Rotation is free.** Change the secret in the vault; the next run picks it up
+  with no pipeline edit and no redeploy.
+- **Nothing is duplicated.** The credential lives in exactly one place.
+- **Typos fail immediately.** References are checked against the live vault when
+  a pipeline is created or updated. A reference that does not resolve is a
+  `400` naming the exact bad key — not a 4am failure.
+
+```
+These secret references do not exist in the secrets manager:
+Root/DOES_NOT_EXST. Add them to the vault first, or fix the reference.
+```
+
+If a referenced secret is **deleted later**, two things catch it:
+`GET /api/pipelines/:id/validate` reports it (and the dashboard's "Check refs"
+button surfaces it), and the run itself fails loudly rather than starting
+without the credential.
+
+`GET /api/secrets` lists the key names available in the vault — names only,
+never values.
+
+### Reaching the vault
+
+`secret-manager` publishes only on `127.0.0.1:8000` of the *host*, so a
+container cannot reach it via `host-gateway`, and the two services live in
+different compose projects (hence isolated bridge networks). Rather than modify
+that service, the runner **joins secret-manager's docker network at boot** using
+the socket it already holds, then addresses it as `http://secret-manager:8000`.
+This is idempotent and re-run every boot, so it self-heals if either container
+is recreated.
+
+It needs `SECRET_MANAGER_TOKEN` — a **read** token is sufficient. Without it,
+pipelines that use no references still run normally.
 
 ## API
 
@@ -126,6 +179,7 @@ committed and pushed. No file changes is a success, not a failure.
 | `idempotent` | `true` | May be auto-retried after an interrupted run |
 | `overlap_policy` | `skip` | `skip` or `queue` when a run is still going |
 | `commit_results` | `true` | Set false for a pipeline with no output |
+| `secret_refs` | `{}` | `ENV_VAR` → `Folder/KEY` in the vault; validated on save |
 | `notify_on_success` | `false` | Failures always notify |
 
 ## Run statuses

@@ -84,6 +84,9 @@
             <span class="pipeline-actions">
               <button class="btn btn-sm" data-act="trigger" data-id="${p.id}">Run now</button>
               <button class="btn btn-sm" data-act="toggle" data-id="${p.id}">${p.enabled ? "Disable" : "Enable"}</button>
+              ${Object.keys(p.secret_refs || {}).length
+                ? `<button class="btn btn-sm" data-act="checkrefs" data-id="${p.id}">Check refs</button>`
+                : ""}
               <button class="btn btn-sm" data-act="edit" data-id="${p.id}">Edit</button>
               <button class="btn btn-sm" data-act="delete" data-id="${p.id}">Delete</button>
             </span>
@@ -192,8 +195,24 @@
       }
       f.elements.env.value = envToText(pipeline.env_keys);
       f.elements.env.placeholder = "Leave blank to keep the stored values";
+      // References are names, not values, so they round-trip in full.
+      f.elements.secret_refs.value = Object.entries(pipeline.secret_refs || {})
+        .map(([k, v]) => `${k}=${v}`)
+        .join("\n");
     }
     $("form-dialog").showModal();
+  }
+
+  function parseKV(text, label) {
+    const out = {};
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const idx = trimmed.indexOf("=");
+      if (idx < 1) throw new Error(`${label} line is not KEY=value: ${trimmed}`);
+      out[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
+    }
+    return out;
   }
 
   function collectForm() {
@@ -206,20 +225,14 @@
       else body[el.name] = el.value;
     }
 
+    // Blank env means "keep what is stored", since values never round-trip.
     const envText = (body.env || "").trim();
-    if (envText) {
-      const env = {};
-      for (const line of envText.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const idx = trimmed.indexOf("=");
-        if (idx < 1) throw new Error(`Env line is not KEY=value: ${trimmed}`);
-        env[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1);
-      }
-      body.env = env;
-    } else {
-      delete body.env;
-    }
+    if (envText) body.env = parseKV(envText, "Env");
+    else delete body.env;
+
+    // References DO round-trip, so blank genuinely means "none".
+    body.secret_refs = parseKV((body.secret_refs || "").trim(), "Secret refs");
+
     return body;
   }
 
@@ -255,6 +268,18 @@
         const p = pipelines.find((x) => x.id === id);
         await api(`/api/pipelines/${id}/${p.enabled ? "disable" : "enable"}`, { method: "POST" });
         await refresh();
+      } else if (act === "checkrefs") {
+        const res = await fetch(`/api/pipelines/${id}/validate`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const body = await res.json();
+        alert(
+          body.ok
+            ? "All secret references resolve."
+            : body.error
+              ? `Could not check: ${body.error}`
+              : `Missing from the vault:\n\n${(body.missing || []).join("\n")}`,
+        );
       } else if (act === "edit") {
         openForm(pipelines.find((x) => x.id === id));
       } else if (act === "delete") {

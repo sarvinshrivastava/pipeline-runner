@@ -11,6 +11,7 @@ import { config } from "./config.ts";
 import { requireAuth } from "./auth.ts";
 import { encryptEnv, decryptEnv } from "./crypto.ts";
 import { ValidationError, parsePipelineInput } from "./lib/validate.ts";
+import { listKeys, validateRefs } from "./secretsmanager.ts";
 import { executeRun, killRun, readLog } from "./executor.ts";
 import {
   isHealthy,
@@ -58,6 +59,14 @@ function envKeys(p: Pipeline): string[] {
   }
 }
 
+function parseRefs(p: Pipeline): Record<string, string> {
+  try {
+    return JSON.parse(p.secret_refs || "{}") as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
 /** Never returns encrypted_env - only which keys exist. */
 function serialisePipeline(p: Pipeline) {
   const pending = nextPendingRun(p.id);
@@ -70,9 +79,10 @@ function serialisePipeline(p: Pipeline) {
       nextRun = null;
     }
   }
-  const { encrypted_env: _ignored, ...rest } = p;
+  const { encrypted_env: _ignored, secret_refs: _refs, ...rest } = p;
   return {
     ...rest,
+    secret_refs: parseRefs(p),
     env_keys: envKeys(p),
     next_run: nextRun,
     busy: isPipelineBusy(p.id),
@@ -102,7 +112,33 @@ function pipelineToInput(p: Pipeline): Record<string, unknown> {
     overlap_policy: p.overlap_policy,
     notify_on_success: p.notify_on_success === 1,
     commit_results: p.commit_results === 1,
+    secret_refs: parseRefs(p),
   };
+}
+
+/**
+ * Rejects a pipeline whose secret references do not resolve, so a typo fails
+ * here with a precise message rather than at 4am when the run fires.
+ */
+async function assertRefsExist(refsJson: string): Promise<Response | null> {
+  const refs = JSON.parse(refsJson || "{}") as Record<string, string>;
+  if (Object.keys(refs).length === 0) return null;
+
+  const result = await validateRefs(refs);
+  if (result.ok) return null;
+
+  if (result.error) {
+    return json(502, {
+      error: `Could not verify secret references: ${result.error}`,
+      secret_refs: refs,
+    });
+  }
+  return json(400, {
+    error:
+      `These secret references do not exist in the secrets manager: ` +
+      `${result.missing.join(", ")}. Add them to the vault first, or fix the reference.`,
+    missing: result.missing,
+  });
 }
 
 async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
@@ -142,6 +178,8 @@ async function handleApi(req: Request, path: string, url: URL): Promise<Response
       if (getPipelineByName(pipeline.name)) {
         return json(409, { error: `A pipeline named '${pipeline.name}' already exists` });
       }
+      const refCheck = await assertRefsExist(pipeline.secret_refs);
+      if (refCheck) return refCheck;
       const created = insertPipeline({ ...pipeline, encrypted_env: encryptEnv(env) });
       await replan(created);
       return json(201, serialisePipeline(getPipeline(created.id)!));
@@ -150,7 +188,9 @@ async function handleApi(req: Request, path: string, url: URL): Promise<Response
   }
 
   // ---- single pipeline + sub-actions
-  const pipeMatch = path.match(/^\/api\/pipelines\/([^/]+)(?:\/(trigger|enable|disable))?$/);
+  const pipeMatch = path.match(
+    /^\/api\/pipelines\/([^/]+)(?:\/(trigger|enable|disable|validate))?$/,
+  );
   if (pipeMatch) {
     const id = pipeMatch[1]!;
     const action = pipeMatch[2];
@@ -169,6 +209,8 @@ async function handleApi(req: Request, path: string, url: URL): Promise<Response
         if (parsed.name !== pipeline.name && getPipelineByName(parsed.name)) {
           return json(409, { error: `A pipeline named '${parsed.name}' already exists` });
         }
+        const refCheck = await assertRefsExist(parsed.secret_refs);
+        if (refCheck) return refCheck;
         const patch: Partial<Pipeline> = { ...parsed };
         if ("env" in body) patch.encrypted_env = encryptEnv(env);
         const updated = updatePipeline(pipeline.id, patch)!;
@@ -181,6 +223,19 @@ async function handleApi(req: Request, path: string, url: URL): Promise<Response
         return ok({ deleted: pipeline.id });
       }
       return json(405, { error: "Method not allowed" });
+    }
+
+    if (action === "validate") {
+      if (method !== "GET" && method !== "POST") {
+        return json(405, { error: "Method not allowed" });
+      }
+      const refs = parseRefs(pipeline);
+      const result = await validateRefs(refs);
+      return json(result.ok ? 200 : result.error ? 502 : 400, {
+        pipeline: pipeline.name,
+        secret_refs: refs,
+        ...result,
+      });
     }
 
     if (method !== "POST") return json(405, { error: "Method not allowed" });
@@ -200,6 +255,16 @@ async function handleApi(req: Request, path: string, url: URL): Promise<Response
     const updated = updatePipeline(pipeline.id, { enabled })!;
     await replan(updated);
     return ok(serialisePipeline(updated));
+  }
+
+  // ---- vault key names (never values), so the dashboard can offer a picker
+  if (path === "/api/secrets" && method === "GET") {
+    try {
+      const keys = await listKeys(url.searchParams.get("refresh") === "1");
+      return ok({ keys: [...keys].sort() });
+    } catch (e) {
+      return json(502, { error: (e as Error).message });
+    }
   }
 
   // ---- runs

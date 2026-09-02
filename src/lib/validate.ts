@@ -8,6 +8,7 @@
  */
 import parser from "cron-parser";
 import { config } from "../config.ts";
+import { parseRef, SecretRefError } from "../secretsmanager.ts";
 import type { NewPipeline, OverlapPolicy } from "../db.ts";
 
 export class ValidationError extends Error {}
@@ -123,6 +124,30 @@ function bool(value: unknown, dflt: boolean): number {
   return value === true || value === 1 || value === "true" ? 1 : 0;
 }
 
+/**
+ * Validates the SHAPE of secret references. Whether each one actually exists in
+ * the vault is checked separately, against the live secrets manager.
+ */
+export function validateSecretRefs(value: unknown): Record<string, string> {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) fail("secret_refs must be an object");
+
+  const out: Record<string, string> = {};
+  for (const [envName, ref] of Object.entries(value as Record<string, unknown>)) {
+    if (!ENV_KEY_RE.test(envName)) {
+      fail(`secret_refs key '${envName}' is not a valid environment variable name`);
+    }
+    if (typeof ref !== "string") fail(`secret_refs value for '${envName}' must be a string`);
+    try {
+      out[envName] = parseRef(ref).full;
+    } catch (e) {
+      if (e instanceof SecretRefError) fail(e.message);
+      throw e;
+    }
+  }
+  return out;
+}
+
 export interface ParsedPipeline {
   pipeline: Omit<NewPipeline, "encrypted_env">;
   env: Record<string, string>;
@@ -160,6 +185,7 @@ export function parsePipelineInput(body: Record<string, unknown>): ParsedPipelin
   return {
     env: validateEnv(body.env),
     pipeline: {
+      secret_refs: JSON.stringify(validateSecretRefs(body.secret_refs)),
       name: validateName(String(body.name ?? "")),
       repo_url: validateRepoUrl(String(body.repo_url ?? "")),
       branch: validateRef(String(body.branch ?? "main"), "branch"),

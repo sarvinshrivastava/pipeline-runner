@@ -51,6 +51,12 @@ export interface Pipeline {
   notify_on_success: number;
   commit_results: number;
   encrypted_env: string;
+  /**
+   * JSON map of env-var name -> secrets-manager reference ("Folder/KEY").
+   * Stored in the clear: these are names, never values. Values are fetched
+   * fresh at run time, so rotating a secret needs no pipeline edit.
+   */
+  secret_refs: string;
   created_at: number;
   updated_at: number;
 }
@@ -114,6 +120,7 @@ function migrate(): void {
       notify_on_success INTEGER NOT NULL DEFAULT 0,
       commit_results    INTEGER NOT NULL DEFAULT 1,
       encrypted_env     TEXT NOT NULL DEFAULT '',
+      secret_refs       TEXT NOT NULL DEFAULT '{}',
       created_at        INTEGER NOT NULL,
       updated_at        INTEGER NOT NULL
     );
@@ -144,6 +151,16 @@ function migrate(): void {
     CREATE INDEX IF NOT EXISTS runs_status_sched ON runs(status, scheduled_for);
     CREATE INDEX IF NOT EXISTS runs_pipeline_time ON runs(pipeline_id, scheduled_for DESC);
   `);
+
+  // Additive migrations for databases created before a column existed.
+  addColumnIfMissing("pipelines", "secret_refs", "TEXT NOT NULL DEFAULT '{}'");
+}
+
+function addColumnIfMissing(table: string, column: string, definition: string): void {
+  const cols = db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 // ---------------------------------------------------------------- pipelines
@@ -177,14 +194,14 @@ export function insertPipeline(p: NewPipeline): Pipeline {
          id, name, repo_url, branch, output_branch, image, command, cron, timezone,
          enabled, timeout_sec, max_late_sec, late_warn_sec, memory_mb, cpus,
          idempotent, overlap_policy, notify_on_success, commit_results,
-         encrypted_env, created_at, updated_at
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         encrypted_env, secret_refs, created_at, updated_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       id, p.name, p.repo_url, p.branch, p.output_branch, p.image, p.command, p.cron,
       p.timezone, p.enabled, p.timeout_sec, p.max_late_sec, p.late_warn_sec,
       p.memory_mb, p.cpus, p.idempotent, p.overlap_policy, p.notify_on_success,
-      p.commit_results, p.encrypted_env, now, now,
+      p.commit_results, p.encrypted_env, p.secret_refs, now, now,
     );
   return getPipeline(id)!;
 }
@@ -193,7 +210,7 @@ const UPDATABLE = new Set<keyof Pipeline>([
   "name", "repo_url", "branch", "output_branch", "image", "command", "cron",
   "timezone", "enabled", "timeout_sec", "max_late_sec", "late_warn_sec",
   "memory_mb", "cpus", "idempotent", "overlap_policy", "notify_on_success",
-  "commit_results", "encrypted_env",
+  "commit_results", "encrypted_env", "secret_refs",
 ]);
 
 export function updatePipeline(id: string, patch: Partial<Pipeline>): Pipeline | null {

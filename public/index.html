@@ -64,6 +64,7 @@
         <label>CPUs<input name="cpus" type="number" value="1" step="0.1" min="0.1"></label>
         <label>Overlap<select name="overlap_policy"><option value="skip">skip</option><option value="queue">queue</option></select></label>
         <label class="span2">Env (KEY=value per line, encrypted at rest)<textarea name="env" rows="3" placeholder="API_KEY=…"></textarea></label>
+        <label class="span2">Secret refs (ENV_VAR=Folder/KEY per line — checked against the vault on save)<textarea name="secret_refs" rows="3" placeholder="GIT_TOKEN=Root/PIPELINE_RUNNER_GITHUB_TOKEN"></textarea></label>
         <label class="check"><input name="commit_results" type="checkbox" checked> Commit results back to git</label>
         <label class="check"><input name="idempotent" type="checkbox" checked> Safe to retry automatically</label>
         <label class="check"><input name="notify_on_success" type="checkbox"> Notify on success</label>

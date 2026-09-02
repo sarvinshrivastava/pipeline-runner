@@ -46,6 +46,7 @@ function mkPipeline(overrides: Partial<NewPipeline> = {}): Pipeline {
     notify_on_success: 0,
     commit_results: 0,
     encrypted_env: "",
+    secret_refs: "{}",
     ...overrides,
   });
 }
