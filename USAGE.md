@@ -10,7 +10,7 @@ Everything here assumes the service is live at
 Every `/api/*` call needs it. It lives in the secrets manager, not in this repo:
 
 ```bash
-export PLR_TOKEN=$(curl -s http://localhost:8000/api/secrets/Root/PIPELINE_RUNNER_API_TOKEN \
+export PLR_TOKEN=$(curl -s https://secrets.sarvinshrivastava.space/api/secrets/Root/PIPELINE_RUNNER_API_TOKEN \
   -H "Authorization: Bearer $(grep SECRET_MANAGER_ADMIN_TOKEN /root/secrets-manager/.env | cut -d= -f2)" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
 ```
