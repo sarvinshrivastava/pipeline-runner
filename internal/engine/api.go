@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"time"
 
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
@@ -490,4 +491,57 @@ func waitReply[T any](ctx context.Context, ch chan T, unpack func(T) (model.Run,
 	case <-ctx.Done():
 		return model.Run{}, false, ErrBusy
 	}
+}
+
+// Check is one line of a validation report.
+type Check struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// CheckJob re-validates a stored job against its owner's current settings
+// and the vault, as the run would at fire time.
+func (e *Engine) CheckJob(ctx context.Context, j model.Job, owner model.Principal) []Check {
+	var checks []Check
+	add := func(name string, err error) {
+		c := Check{Name: name, OK: err == nil}
+		if err != nil {
+			c.Detail = err.Error()
+		}
+		checks = append(checks, c)
+	}
+	if h := j.Target.HTTP; h != nil {
+		var err error
+		if u, perr := url.Parse(h.URL); perr != nil || !model.HostAllowed(u.Hostname(), owner.CallbackHosts) {
+			err = errors.New("callback host is not in the client's callback_hosts")
+		}
+		add("callback_host", err)
+	}
+	if j.Target.Container != nil || j.Target.Inline != nil {
+		var err error
+		switch {
+		case !e.d.ContainersEnabled:
+			err = errors.New("container targets are not enabled on this runner")
+		case !owner.ContainerAllowed:
+			err = errors.New("the client may not run containers")
+		}
+		add("containers", err)
+	}
+	for _, ref := range j.Spec().Refs() {
+		if _, err := model.CheckRef(ref, owner); err != nil {
+			add("secret "+ref, err)
+			continue
+		}
+		add("secret "+ref, e.checkRefsExist(ctx, model.RunSpec{Target: model.Target{Type: model.TargetHTTP,
+			HTTP: &model.HTTPTarget{Auth: model.HTTPAuth{BearerRef: ref}}}}))
+	}
+	if j.Trigger.Type == model.TriggerCron || j.Trigger.Type == model.TriggerAt {
+		var err error
+		if len(NextFires(j, e.now(), 1)) == 0 {
+			err = errors.New("the trigger has no future fire time")
+		}
+		add("schedule", err)
+	}
+	return checks
 }
