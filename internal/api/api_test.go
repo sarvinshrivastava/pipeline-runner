@@ -271,6 +271,14 @@ func TestAuthMatrixAndOwnership(t *testing.T) {
 	if r := e.do("POST", "/v1/jobs", tokA, job); r.status != 403 {
 		t.Fatalf("client acting for another: %d", r.status)
 	}
+	// An admin-scoped client sees every client's jobs on list as on get.
+	_, tokOps := e.client("ops", "admin")
+	if r := e.do("GET", "/v1/jobs", tokOps, nil); len(r.json(t)["items"].([]any)) != 2 {
+		t.Fatalf("admin client list: %s", r.body)
+	}
+	if r := e.do("GET", "/v1/jobs/"+id, tokOps, nil); r.status != 200 {
+		t.Fatalf("admin client get: %d", r.status)
+	}
 }
 
 func TestHostRefAndHeaderControls(t *testing.T) {

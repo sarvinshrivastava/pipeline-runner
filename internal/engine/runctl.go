@@ -342,4 +342,3 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 func newJobEntry(j model.Job, now time.Time) *jobEntry {
 	return &jobEntry{job: j, minGap: j.MinGap(now)}
 }
-

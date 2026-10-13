@@ -189,7 +189,8 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalFrom(r)
 	clientID := p.ClientID
-	if isBootstrap(p) {
+	if p.Admin { // admins list every client's jobs, optionally filtered
+		clientID = ""
 		if name := r.URL.Query().Get("client"); name != "" {
 			c, err := store.ClientByName(r.Context(), s.d.Store.R, name)
 			if err != nil {
@@ -454,7 +455,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalFrom(r)
 	f := store.RunFilter{JobID: r.URL.Query().Get("job"), Status: r.URL.Query().Get("status"), Cursor: cursor, Limit: limit + 1}
-	if !isBootstrap(p) {
+	if !p.Admin {
 		f.ClientID = p.ClientID
 	}
 	runs, err := store.ListRuns(r.Context(), s.d.Store.R, f)
