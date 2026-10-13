@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -22,3 +25,7 @@ jobs:
         run: go test -race ./...
       - name: Fire-delay precision (acceptance 1, without the race detector)
         run: go test -run TestFireDelayP99 -count=1 ./internal/engine/
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - name: Image builds
+        run: docker build -q -t plr-ci .

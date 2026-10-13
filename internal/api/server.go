@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -70,6 +71,9 @@ func New(d Deps) *Server {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if v := recover(); v != nil {
+			if v == http.ErrAbortHandler { //nolint:errorlint // sentinel compared as net/http does
+				panic(v)
+			}
 			s.d.Log.Error("panic in handler", "panic", v, "stack", string(debug.Stack()))
 			writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		}
@@ -144,8 +148,14 @@ func (s *Server) wrap(rt route) http.Handler {
 				writeError(w, http.StatusTooManyRequests, "rate_limited", "too many failed attempts")
 				return
 			}
-			p, ok := s.authenticate(r)
-			if !ok {
+			p, err := s.authenticate(r)
+			if err != nil && !errors.Is(err, errBadToken) {
+				// A storage fault is not the caller's fault: no lockout strike.
+				s.d.Log.Error("authenticate", "err", err)
+				writeError(w, http.StatusServiceUnavailable, "unavailable", "could not verify the token; retry shortly")
+				return
+			}
+			if err != nil {
 				s.limiter.fail(ip)
 				w.Header().Set("WWW-Authenticate", `Bearer realm="pipeline-runner"`)
 				writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid token")
@@ -161,21 +171,27 @@ func (s *Server) wrap(rt route) http.Handler {
 	})
 }
 
-func (s *Server) authenticate(r *http.Request) (model.Principal, bool) {
+func (s *Server) authenticate(r *http.Request) (model.Principal, error) {
 	h := r.Header.Get("Authorization")
 	tok, ok := strings.CutPrefix(h, "Bearer ")
 	if !ok || tok == "" {
-		return model.Principal{}, false
+		return model.Principal{}, errBadToken
 	}
 	if secure.EqualDigest(tok, s.d.APIToken) {
-		return model.Principal{Name: "admin", Admin: true, Scopes: model.AllScopes}, true
+		return model.Principal{Name: "admin", Admin: true, Scopes: model.AllScopes}, nil
 	}
 	c, err := store.ClientByTokenHash(r.Context(), s.d.Store.R, secure.HashToken(tok), s.d.Now())
-	if err != nil {
-		return model.Principal{}, false
+	if errors.Is(err, store.ErrNotFound) {
+		return model.Principal{}, errBadToken
 	}
-	return model.PrincipalOf(c), true
+	if err != nil {
+		return model.Principal{}, err
+	}
+	return model.PrincipalOf(c), nil
 }
+
+// errBadToken is a token that matches nothing, as opposed to a lookup failure.
+var errBadToken = errors.New("bad token")
 
 // clientIP is the right-most X-Forwarded-For hop that is not a trusted
 // proxy, honoured only when the direct peer is itself trusted.

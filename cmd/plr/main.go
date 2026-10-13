@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -133,9 +134,14 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 		RunTokenKey: cfg.RunTokenKey, EnvKey: cfg.EncryptionKey, MaxHTTPInflight: cfg.MaxHTTPInflight,
 		MaxContainers: cfg.MaxContainers, DataDir: cfg.DataDir, RetentionDays: cfg.RunRetentionDays,
 		ContainersEnabled: false, // container/inline targets arrive in delivery 1b
+		CallbackPolicy:    callbackPolicy,
 	})
 	if err := eng.Start(ctx); err != nil {
 		return fmt.Errorf("start engine: %w", err)
+	}
+	checkProxies(log, cfg.TrustedProxies, readGateways())
+	if cfg.EnableContainerTargets {
+		log.Warn("ENABLE_CONTAINER_TARGETS is set but this build serves HTTP targets only; ignoring it")
 	}
 
 	apiSrv := &http.Server{
@@ -152,12 +158,14 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	var lc net.ListenConfig
 	apiLn, err := lc.Listen(ctx, "tcp", ":"+strconv.Itoa(cfg.Port))
 	if err != nil {
-		return err
+		eng.Stop(ctx, time.Now())
+		return fmt.Errorf("listen api :%d: %w", cfg.Port, err)
 	}
 	metricsLn, err := lc.Listen(ctx, "tcp", ":"+strconv.Itoa(cfg.MetricsPort))
 	if err != nil {
 		_ = apiLn.Close()
-		return err
+		eng.Stop(ctx, time.Now())
+		return fmt.Errorf("listen metrics :%d: %w", cfg.MetricsPort, err)
 	}
 	errs := make(chan error, 2)
 	go func() { errs <- serve(apiSrv, apiLn) }()
@@ -181,13 +189,19 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 		eng.Stop(shutdownCtx, time.Now().Add(20*time.Second))
 		close(done)
 	}()
-	_ = apiSrv.Shutdown(shutdownCtx)
-	_ = metricsSrv.Shutdown(shutdownCtx)
+	if err := apiSrv.Shutdown(shutdownCtx); err != nil {
+		log.Warn("api shutdown", "err", err)
+	}
+	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+		log.Warn("metrics shutdown", "err", err)
+	}
 	log.Info("api closed")
 	<-done
 	log.Info("engine stopped")
 	stopNotify()
-	pager.Drain(context.Background())
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDrain()
+	pager.Drain(drainCtx)
 	return runErr
 }
 
@@ -200,8 +214,8 @@ func serve(srv *http.Server, ln net.Listener) error {
 
 // heartbeat pings an Uptime Kuma push monitor every 60 s while the engine is
 // healthy, so the runner's own death is visible from outside.
-func heartbeat(ctx context.Context, url string, eng *engine.Engine, log *slog.Logger) {
-	if url == "" {
+func heartbeat(ctx context.Context, pushURL string, eng *engine.Engine, log *slog.Logger) {
+	if pushURL == "" {
 		return
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -209,9 +223,15 @@ func heartbeat(ctx context.Context, url string, eng *engine.Engine, log *slog.Lo
 	defer tick.Stop()
 	for {
 		if eng.Healthy() {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			if err == nil {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, pushURL, nil)
+			if err != nil {
+				log.Warn("heartbeat request", "err", "invalid HEARTBEAT_URL")
+			} else {
 				if resp, err := client.Do(req); err != nil {
+					var ue *url.Error
+					if errors.As(err, &ue) {
+						err = ue.Err // the URL carries the push token
+					}
 					log.Warn("heartbeat failed", "err", err)
 				} else {
 					_ = resp.Body.Close()

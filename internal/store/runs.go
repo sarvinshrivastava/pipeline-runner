@@ -255,16 +255,16 @@ func HasScheduleRunFor(ctx context.Context, q Querier, jobID string, nominal tim
 
 // DeletePendingSchedule deletes a job's pending schedule run and returns its
 // nominal instant (nil when there was none).
-func DeletePendingSchedule(ctx context.Context, q Querier, jobID string) (*time.Time, error) {
-	var nominal sql.NullInt64
-	err := q.QueryRowContext(ctx, `DELETE FROM runs WHERE job_id = ? AND trigger = 'schedule' AND status = 'pending' RETURNING nominal_for`, jobID).Scan(&nominal)
+func DeletePendingSchedule(ctx context.Context, q Querier, jobID string) (id string, nominal *time.Time, err error) {
+	var n sql.NullInt64
+	err = q.QueryRowContext(ctx, `DELETE FROM runs WHERE job_id = ? AND trigger = 'schedule' AND status = 'pending' RETURNING id, nominal_for`, jobID).Scan(&id, &n)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return "", nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	return fromNullMs(nominal), nil
+	return id, fromNullMs(n), nil
 }
 
 // CancelPendingForJob cancels a job's pending runs of the given kinds and

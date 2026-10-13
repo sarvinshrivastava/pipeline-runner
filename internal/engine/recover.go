@@ -273,10 +273,24 @@ func (e *Engine) reconcile(now time.Time) {
 		e.log.Error("reconcile: load pending", "err", err)
 		return
 	}
+	isPending := make(map[string]bool, len(pending))
 	for _, r := range pending {
+		isPending[r.ID] = true
 		if e.inHeap[r.ID] == 0 && e.parked[r.ID] == "" {
 			e.log.Warn("reconcile: pending run missing from heap; re-pushed", "run", r.ID)
 			e.push(r.ID, r.ScheduledFor)
+		}
+	}
+	// Ghosts (runs no longer pending) leave the pending count; their heap
+	// entries are skipped when due.
+	for id := range e.inHeap {
+		if !isPending[id] {
+			delete(e.inHeap, id)
+		}
+	}
+	for id := range e.parked {
+		if !isPending[id] {
+			e.unpark(id)
 		}
 	}
 	e.ensureAllMaterialised(pending)

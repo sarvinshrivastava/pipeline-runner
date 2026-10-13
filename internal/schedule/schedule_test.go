@@ -112,15 +112,15 @@ func TestNeverFires(t *testing.T) {
 func TestEvery(t *testing.T) {
 	s := mustParse(t, "@every 90s", "UTC")
 	assertFires(t, s, utc("2026-10-13T00:00:00Z"), []string{"2026-10-13T00:01:30Z", "2026-10-13T00:03:00Z"})
-	if !s.HasSeconds() {
-		t.Fatal("@every must count as sub-minute capable")
+	if s.MinGap(utc("2026-10-13T00:00:00Z"), 10) != 90*time.Second {
+		t.Fatal("@every gap misread")
 	}
 }
 
 func TestSixField(t *testing.T) {
 	s := mustParse(t, "*/10 * * * * *", "UTC")
 	assertFires(t, s, utc("2026-10-13T00:00:00Z"), []string{"2026-10-13T00:00:10Z", "2026-10-13T00:00:20Z"})
-	if !s.HasSeconds() || s.MinGap(utc("2026-10-13T00:00:00Z"), 50) != 10*time.Second {
+	if s.MinGap(utc("2026-10-13T00:00:00Z"), 50) != 10*time.Second {
 		t.Fatal("six-field schedule misclassified")
 	}
 }
@@ -159,6 +159,17 @@ func TestPropertyStrictlyIncreasing(t *testing.T) {
 					t.Fatalf("%s %s: fire %d (%s) not after %s", e, z, i, fires[i], fires[i-1])
 				}
 			}
+		}
+	}
+}
+
+func TestEveryHourGapAndHourStepsAreWallClock(t *testing.T) {
+	if g := mustParse(t, "@every 1h", "UTC").MinGap(utc("2026-10-13T00:00:00Z"), 5); g != time.Hour {
+		t.Fatalf("@every 1h gap = %s", g)
+	}
+	for expr, want := range map[string]bool{"0 9-17/2 * * *": true, "0 */3 * * *": true, "0 * * * *": false, "0 */1 * * *": false} {
+		if got := classify(expr); got != want {
+			t.Errorf("classify(%q) = %v, want %v", expr, got, want)
 		}
 	}
 }

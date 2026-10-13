@@ -100,6 +100,15 @@ func TestIPAllowed(t *testing.T) {
 		{"example.com", "10.0.0.5", false},
 		{"example.com", "93.184.216.34", true},
 		{"api.example.com", "fd00::1", false},
+		{"fd00::1", "fd00::1", false},        // private IPv6 literal
+		{"10.0.0.5", "10.0.0.5", false},      // private IPv4 literal
+		{"", "172.18.0.5", false},            // no requested host: fail closed
+		{"example.com", "100.64.1.1", false}, // CGNAT behind a dotted name
+		{"reel-drop", "100.64.1.1", true},
+		{"example.com", "198.18.0.1", false},
+		{"example.com", "255.255.255.255", false},
+		{"example.com", "64:ff9b::a00:5", false}, // NAT64 of 10.0.0.5
+		{"example.com", "2002:a00:5::1", false},  // 6to4
 	}
 	for _, c := range cases {
 		if got := IPAllowed(c.host, netip.MustParseAddr(c.ip)); got != c.want {

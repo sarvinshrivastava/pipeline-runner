@@ -7,10 +7,11 @@ import (
 
 func validEnv() map[string]string {
 	return map[string]string{
-		"DATA_DIR":       "/data",
-		"API_TOKEN":      strings.Repeat("a", 32),
-		"RUN_TOKEN_KEY":  strings.Repeat("ab", 32),
-		"ENCRYPTION_KEY": strings.Repeat("cd", 32),
+		"DATA_DIR":        "/data",
+		"API_TOKEN":       strings.Repeat("a", 32),
+		"RUN_TOKEN_KEY":   strings.Repeat("ab", 32),
+		"ENCRYPTION_KEY":  strings.Repeat("cd", 32),
+		"TRUSTED_PROXIES": "none",
 	}
 }
 
@@ -58,6 +59,8 @@ func TestLoadRejects(t *testing.T) {
 		"bad int":            func(e map[string]string) { e["PORT"] = "abc" },
 		"same ports":         func(e map[string]string) { e["METRICS_PORT"] = "3000" },
 		"bad proxy":          func(e map[string]string) { e["TRUSTED_PROXIES"] = "nope" },
+		"no proxy setting":   func(e map[string]string) { delete(e, "TRUSTED_PROXIES") },
+		"port too high":      func(e map[string]string) { e["PORT"] = "70000" },
 		"bad bool":           func(e map[string]string) { e["ENABLE_CONTAINER_TARGETS"] = "maybe" },
 		"zero pool":          func(e map[string]string) { e["MAX_HTTP_INFLIGHT"] = "0" },
 		"zero retention day": func(e map[string]string) { e["RUN_RETENTION_DAYS"] = "0" },

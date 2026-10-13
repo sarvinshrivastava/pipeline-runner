@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"regexp"
@@ -47,6 +48,10 @@ func decodeStrict(w http.ResponseWriter, body []byte, v any) bool {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	if dec.More() {
+		writeError(w, http.StatusBadRequest, "invalid_json", "unexpected data after the JSON body")
 		return false
 	}
 	return true
@@ -193,6 +198,10 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		clientID = ""
 		if name := r.URL.Query().Get("client"); name != "" {
 			c, err := store.ClientByName(r.Context(), s.d.Store.R, name)
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusBadRequest, "invalid", "unknown client "+name)
+				return
+			}
 			if err != nil {
 				fail(w, s.d.Log, err)
 				return
@@ -267,7 +276,13 @@ func (s *Server) validateNewJob(w http.ResponseWriter, r *http.Request) {
 		}
 		report["checks"] = []engine.Check{{Name: "validation", OK: false, Detail: detail}}
 	} else {
-		report["checks"] = []engine.Check{{Name: "validation", OK: true}}
+		checks := append([]engine.Check{{Name: "validation", OK: true}}, s.d.Engine.CheckJob(r.Context(), j, owner)...)
+		for _, c := range checks {
+			if !c.OK {
+				report["ok"] = false
+			}
+		}
+		report["checks"] = checks
 		report["next_fires"] = engine.NextFires(j, s.d.Now(), 5)
 	}
 	writeJSON(w, http.StatusOK, report)
@@ -455,6 +470,10 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalFrom(r)
 	f := store.RunFilter{JobID: r.URL.Query().Get("job"), Status: r.URL.Query().Get("status"), Cursor: cursor, Limit: limit + 1}
+	if f.Status != "" && !model.Status(f.Status).Valid() {
+		writeError(w, http.StatusBadRequest, "invalid", "unknown status "+f.Status)
+		return
+	}
 	if !p.Admin {
 		f.ClientID = p.ClientID
 	}
@@ -483,8 +502,12 @@ func (s *Server) runLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	f, err := os.Open(s.d.Engine.LogPath(run.ID))
-	if err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
 		w.WriteHeader(http.StatusOK) // no log yet (pending) is an empty log
+		return
+	}
+	if err != nil {
+		fail(w, s.d.Log, err)
 		return
 	}
 	defer func() { _ = f.Close() }()
@@ -582,6 +605,10 @@ var (
 	topicRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 )
 
+// reservedCallbackHosts are the runner's own container and the vault: a job
+// calling either could replay its bearer against them or read their answers.
+var reservedCallbackHosts = map[string]bool{"pipeline-runner": true, "secret-manager": true, "localhost": true}
+
 func applyClient(c *model.Client, in clientIn) error {
 	bad := func(field, msg string) error { return &model.FieldError{Field: field, Code: "invalid", Message: msg} }
 	if in.Scopes != nil {
@@ -598,6 +625,9 @@ func applyClient(c *model.Client, in clientIn) error {
 			h = strings.ToLower(strings.TrimSpace(h))
 			if !hostRE.MatchString(h) {
 				return bad("callback_hosts", "invalid hostname "+h)
+			}
+			if reservedCallbackHosts[h] {
+				return bad("callback_hosts", h+" is the runner or the vault; jobs may not call it")
 			}
 			hosts = append(hosts, h)
 		}

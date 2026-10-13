@@ -4,3 +4,9 @@ learnings
 *.md
 plr
 *.test
+.env
+data
+*.db
+*.db-*
+.github
+.claude

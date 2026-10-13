@@ -185,6 +185,34 @@ func TestHeartbeatCappedByDeadline(t *testing.T) {
 	h.waitStatus(r.ID, model.StatusTimeout)
 }
 
+// An expiry already queued when a heartbeat re-arms the lease must not
+// interrupt the run, whether its generation is stale or the stored lease moved.
+func TestStaleLeaseExpiryIgnoredAfterHeartbeat(t *testing.T) {
+	h := newHarness(t)
+	h.exec.set(waiting)
+	j := h.create(asyncJob("pub"))
+	r := invoke(t, h, j.ID)
+	h.waitStatus(r.ID, model.StatusWaiting)
+	var before uint64
+	h.onLoop(func() { before = h.e.leaseGen[r.ID] })
+	h.advance(30 * time.Second)
+	if _, _, err := h.e.Heartbeat(context.Background(), r.ID); err != nil {
+		t.Fatal(err)
+	}
+	var current uint64
+	h.onLoop(func() {
+		current = h.e.leaseGen[r.ID]
+		h.e.onLeaseExpired(r.ID, before) // stale generation
+	})
+	if current == before {
+		t.Fatal("re-arm reused the lease generation")
+	}
+	h.onLoop(func() { h.e.onLeaseExpired(r.ID, current) }) // lease still valid in the DB
+	if got := h.run(r.ID); got.Status != model.StatusWaiting {
+		t.Fatalf("heartbeated run became %s", got.Status)
+	}
+}
+
 func TestEarlyCompleteBeforeWaiting(t *testing.T) {
 	h := newHarness(t)
 	release := make(chan struct{})
@@ -573,6 +601,21 @@ func TestRetentionPrunes(t *testing.T) {
 	}
 }
 
+// With no sub-minute jobs the 7-day prune must not run for every job.
+func TestRetentionKeepsRecentRunsWithoutFastJobs(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("f", nil))
+	r := invoke(t, h, j.ID)
+	h.waitStatus(r.ID, model.StatusSuccess)
+	h.clk.Advance(10 * 24 * time.Hour)
+	if err := h.e.RunRetention(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetRun(context.Background(), h.st.W, r.ID); err != nil {
+		t.Fatalf("10-day-old run pruned: %v", err)
+	}
+}
+
 func TestShutdownIgnoresResultsAfterDrain(t *testing.T) {
 	h := newHarness(t)
 	g := newGate()
@@ -587,6 +630,40 @@ func TestShutdownIgnoresResultsAfterDrain(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if got := h.run(r.ID); got.Status != model.StatusRunning {
 		t.Fatalf("after drainBy the run is left for boot recovery: %s", got.Status)
+	}
+	h.e = nil
+}
+
+// Draining finishes in-flight work but admits nothing new, even when a slot
+// frees up before drainBy.
+func TestShutdownDrainsInflightWithoutNewDispatch(t *testing.T) {
+	h := newHarness(t)
+	g := newGate()
+	h.exec.set(g.behaviour(okResult()))
+	j := h.create(invokeJob("f", &model.PolicyIn{Overlap: ptr(model.OverlapQueue)}))
+	running := invoke(t, h, j.ID)
+	h.waitStatus(running.ID, model.StatusRunning)
+	queued := invoke(t, h, j.ID)
+	h.sync()
+	stopped := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		h.e.Stop(ctx, h.clk.Now().Add(20*time.Second))
+		close(stopped)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	g.open()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain did not finish after the in-flight run completed")
+	}
+	if got := h.run(running.ID); got.Status != model.StatusSuccess {
+		t.Fatalf("in-flight run: %s", got.Status)
+	}
+	if got := h.run(queued.ID); got.Status != model.StatusPending {
+		t.Fatalf("queued run dispatched during drain: %s", got.Status)
 	}
 	h.e = nil
 }
@@ -632,5 +709,27 @@ func TestRemovedJobRunsLeavePendingCount(t *testing.T) {
 	h.sync()
 	if n := pending(); n != 0 {
 		t.Fatalf("pending = %d after delete and disable, want 0", n)
+	}
+
+	// A PATCH replaces the pending schedule run; a cancel removes it.
+	upd := h.create(cronJob("upd", "0 0 1 1 *", nil))
+	if _, err := h.e.UpdateJob(ctx, upd.ID, model.JobPatch{Trigger: &model.TriggerIn{Type: model.TriggerCron, Cron: "0 0 2 1 *"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+	if n := pending(); n != 1 {
+		t.Fatalf("pending = %d after patch, want 1", n)
+	}
+	runs, err := store.PendingRunsForJob(ctx, h.st.W, upd.ID)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("pending runs: %v %v", runs, err)
+	}
+	if _, _, err := h.e.Cancel(ctx, runs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	var counted bool
+	h.onLoop(func() { _, counted = h.e.inHeap[runs[0].ID] })
+	if counted {
+		t.Fatal("cancelled run still counted as pending")
 	}
 }

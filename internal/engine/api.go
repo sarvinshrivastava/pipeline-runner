@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/url"
 	"time"
 
@@ -73,6 +75,28 @@ func (e *Engine) ValidateJob(ctx context.Context, owner model.Principal, in mode
 		return j, err
 	}
 	return j, e.checkRefsExist(ctx, j.Spec())
+}
+
+// checkResolves resolves the callback host and applies the dial-time policy,
+// so validate reports what the first fire would hit.
+func (e *Engine) checkResolves(ctx context.Context, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	host := u.Hostname()
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return fmt.Errorf("%s does not resolve from the runner", host)
+	}
+	for _, ip := range ips {
+		if !e.d.CallbackPolicy(host, ip) {
+			return fmt.Errorf("%s resolves to %s, which callbacks may not reach", host, ip)
+		}
+	}
+	return nil
 }
 
 // CreateJob validates, stores and schedules a job.
@@ -152,6 +176,7 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 	now := e.now()
 	var next model.Job
 	var inserted []model.Run
+	var dropped []string
 	err = e.st.Tx(ctx, func(tx *sql.Tx) error {
 		cur, err := store.GetJob(ctx, tx, jobID) // re-read inside the transaction
 		if err != nil {
@@ -168,9 +193,12 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 				return err
 			}
 		}
-		deleted, err := store.DeletePendingSchedule(ctx, tx, jobID)
+		deletedID, deleted, err := store.DeletePendingSchedule(ctx, tx, jobID)
 		if err != nil {
 			return err
+		}
+		if deletedID != "" {
+			dropped = append(dropped, deletedID)
 		}
 		switch {
 		case triggerChanged && next.Trigger.Type == model.TriggerCron:
@@ -210,7 +238,7 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 	if err != nil {
 		return next, err
 	}
-	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted})
+	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted, dropped: dropped})
 	return next, nil
 }
 
@@ -448,6 +476,7 @@ func (e *Engine) Await(ctx context.Context, chainRoot string, d time.Duration) (
 		return r, true
 	case <-timer.C:
 	case <-ctx.Done():
+	case <-e.stopping: // shutting down: answer 202 now rather than at drainBy
 	case <-e.life.Done():
 	}
 	return model.Run{}, false
@@ -523,6 +552,9 @@ func (e *Engine) CheckJob(ctx context.Context, j model.Job, owner model.Principa
 			err = errors.New("callback host is not in the client's callback_hosts")
 		}
 		add("callback_host", err)
+		if err == nil && e.d.CallbackPolicy != nil {
+			add("callback_dns", e.checkResolves(ctx, h.URL))
+		}
 	}
 	if j.Target.Container != nil || j.Target.Inline != nil {
 		var err error

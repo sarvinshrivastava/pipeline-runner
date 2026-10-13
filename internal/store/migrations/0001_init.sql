@@ -1,6 +1,6 @@
 CREATE TABLE clients (
   id TEXT PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE CHECK (name GLOB '[a-z0-9]*' AND length(name) BETWEEN 1 AND 32),
+  name TEXT NOT NULL UNIQUE CHECK (name GLOB '[a-z0-9]*' AND name NOT GLOB '*[^a-z0-9-]*' AND length(name) BETWEEN 1 AND 32),
   token_hash BLOB NOT NULL UNIQUE,
   prev_token_hash BLOB,
   prev_valid_until INTEGER,
@@ -79,6 +79,7 @@ CREATE INDEX runs_due ON runs(status, scheduled_for);
 CREATE INDEX runs_by_job ON runs(job_id, id DESC);
 CREATE INDEX runs_by_client ON runs(client_id, id DESC);
 CREATE INDEX runs_chain ON runs(chain_root_id);
+CREATE INDEX runs_finished ON runs(finished_at) WHERE finished_at IS NOT NULL;
 
 CREATE TABLE idempotency (
   client_id TEXT NOT NULL,
@@ -90,3 +91,5 @@ CREATE TABLE idempotency (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (client_id, route, key)
 );
+CREATE INDEX clients_prev_token ON clients(prev_token_hash) WHERE prev_token_hash IS NOT NULL;
+CREATE INDEX idempotency_created ON idempotency(created_at);

@@ -16,9 +16,12 @@ services:
     environment:
       - PORT=3000
       - METRICS_PORT=9464
-      - DATA_DIR=${HOST_DATA_DIR:-/root/pipeline-runner-data}
+      - DATA_DIR=/data
+      - GOMEMLIMIT=400MiB  # GC works to stay under mem_limit instead of being OOM-killed
     volumes:
-      - ${HOST_DATA_DIR:-/root/pipeline-runner-data}:${HOST_DATA_DIR:-/root/pipeline-runner-data}
+      # Owned by uid 10001 (the deploy workflow creates it). 1b, which hands
+      # paths to the docker daemon, switches to a same-path bind.
+      - ${HOST_DATA_DIR:-/root/pipeline-runner-data}:/data
     read_only: true
     tmpfs:
       - /tmp

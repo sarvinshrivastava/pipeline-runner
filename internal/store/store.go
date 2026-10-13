@@ -93,6 +93,14 @@ func (s *Store) Tx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
+	// A panic in fn must not leave the single writer connection inside an
+	// open transaction, or every later write blocks.
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
 	if err := fn(tx); err != nil {
 		_ = tx.Rollback()
 		return err

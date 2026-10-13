@@ -56,6 +56,16 @@ const (
 	StatusDeferred    Status = "deferred"
 )
 
+// Valid reports whether s is a known run status.
+func (s Status) Valid() bool {
+	switch s {
+	case StatusPending, StatusRunning, StatusWaiting, StatusSuccess, StatusFailed, StatusTimeout,
+		StatusMissed, StatusSkipped, StatusInterrupted, StatusCancelled, StatusDeferred:
+		return true
+	}
+	return false
+}
+
 // Terminal reports whether no further transition is possible.
 func (s Status) Terminal() bool {
 	switch s {

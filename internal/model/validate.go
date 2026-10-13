@@ -146,7 +146,7 @@ var (
 	// JobNameRE and ClientNameRE are the name formats for jobs and clients.
 	JobNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	// ClientNameRE is the client name format.
-	ClientNameRE  = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+	ClientNameRE  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 	imageRE       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._\-/:@]{0,254}$`)
 	gitRefRE      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._\-/]{0,254}$`)
 	envNameRE     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
@@ -215,6 +215,10 @@ func ValidatePatch(cur Job, in JobPatch, c VCtx) (next Job, triggerChanged bool,
 		pin := in.Policy
 		if pin == nil {
 			pin = policyAsInput(cur.Policy)
+			// An overlap still at the old default follows the new default.
+			if cur.Policy.Overlap == DefaultPolicy(cur.Trigger.Type, cur.Target).Overlap {
+				pin.Overlap = nil
+			}
 		}
 		if next.Policy, err = validatePolicy(pin, trigType, next.Target); err != nil {
 			return Job{}, false, err
@@ -230,6 +234,8 @@ func ValidatePatch(cur Job, in JobPatch, c VCtx) (next Job, triggerChanged bool,
 		if _, err = validateTrigger(TriggerIn{Type: TriggerCron, Cron: cur.Trigger.Cron, Timezone: cur.Trigger.Timezone}, next.Policy, next.Target.Type, c.Now); err != nil {
 			return Job{}, false, err
 		}
+	} else if next.Trigger.Type == TriggerAt && next.Policy.JitterSec >= next.Policy.MaxLateSec {
+		return Job{}, false, fieldErr("policy.jitter_sec", "invalid", "must be less than max_late_sec")
 	}
 	next.NSKey = NSKey(cur.ClientID, next.Policy.ConcurrencyKey)
 	return next, triggerChanged, nil
@@ -305,9 +311,6 @@ func validateTrigger(in TriggerIn, p Policy, targetType string, now time.Time) (
 		}
 		if s.Next(now).IsZero() {
 			return Trigger{}, fieldErr("trigger.cron", "cron_never_fires", "has no occurrence in the next 5 years")
-		}
-		if s.HasSeconds() && targetType != TargetHTTP {
-			return Trigger{}, fieldErr("trigger.cron", "invalid", "sub-minute schedules are only allowed for http targets")
 		}
 		minGap := 60 * time.Second
 		if targetType == TargetHTTP {
@@ -513,14 +516,24 @@ func validateHTTP(in HTTPIn, p Principal) (*HTTPTarget, error) {
 	if !HostAllowed(u.Hostname(), p.CallbackHosts) {
 		return nil, fieldErr("target.http.url", "host_not_allowed", "host %q is not in this client's callback_hosts", u.Hostname())
 	}
+	if u.Scheme == "http" && strings.Contains(u.Hostname(), ".") && (in.Auth.BearerRef != "" || in.Auth.HMACRef != "") {
+		// Docker service names stay on the host's networks; a dotted name may
+		// cross the internet with the secret in cleartext.
+		return nil, fieldErr("target.http.url", "invalid", "must be https when auth is set and the host is not a docker service name")
+	}
 	if len(in.Headers) > MaxHeaders {
 		return nil, fieldErr("target.http.headers", "invalid", "at most %d headers", MaxHeaders)
 	}
+	seen := make(map[string]bool, len(in.Headers))
 	for name, v := range in.Headers {
 		lower := strings.ToLower(name)
 		if !headerNameRE.MatchString(name) || strings.ContainsAny(v, "\r\n") {
 			return nil, fieldErr("target.http.headers", "invalid", "header %q is not a valid header", name)
 		}
+		if seen[lower] { // map order would decide which value is sent
+			return nil, fieldErr("target.http.headers", "invalid", "header %q is given twice in different cases", name)
+		}
+		seen[lower] = true
 		if reservedHeaders[lower] || strings.HasPrefix(lower, "proxy-") || strings.HasPrefix(lower, "x-plr-") {
 			return nil, fieldErr("target.http.headers", "header_reserved", "header %q is reserved; send credentials through auth refs", name)
 		}
@@ -587,6 +600,10 @@ func checkRef(ref string, p Principal) (string, error) {
 	r, err := vault.ParseRef(ref)
 	if err != nil {
 		return "", fieldErr("", "invalid", "%s", err.Error())
+	}
+	if strings.HasPrefix(r.Key, "PIPELINE_RUNNER_") {
+		// The runner's own credentials, whatever prefixes a client holds.
+		return "", fieldErr("", "secret_ref_not_permitted", "secret %q belongs to the runner itself", r.String())
 	}
 	if !vault.Permitted(r, p.SecretRefPrefixes) {
 		return "", fieldErr("", "secret_ref_not_permitted", "secret %q is outside this client's secret_ref_prefixes", r.String())

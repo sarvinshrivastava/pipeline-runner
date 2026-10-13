@@ -83,7 +83,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		DashboardURL:  strings.TrimRight(r.str("DASHBOARD_URL", ""), "/"),
 		HeartbeatURL:  r.str("HEARTBEAT_URL", ""),
 
-		TrustedProxies: r.prefixes("TRUSTED_PROXIES"),
+		TrustedProxies: r.trustedProxies(),
 
 		MaxHTTPInflight:  r.int("MAX_HTTP_INFLIGHT", 64),
 		MaxContainers:    r.int("MAX_CONTAINERS", 4),
@@ -101,8 +101,11 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	if len(c.APIToken) < 32 {
 		errs = append(errs, errors.New("API_TOKEN must be at least 32 characters"))
 	}
-	if c.Port <= 0 || c.MetricsPort <= 0 || c.Port == c.MetricsPort {
-		errs = append(errs, errors.New("PORT and METRICS_PORT must be distinct positive ports"))
+	if c.Port <= 0 || c.MetricsPort <= 0 || c.Port > 65535 || c.MetricsPort > 65535 || c.Port == c.MetricsPort {
+		errs = append(errs, errors.New("PORT and METRICS_PORT must be distinct ports in 1..65535"))
+	}
+	if c.PullTimeoutSec < 1 || c.LogMaxBytes < 1 {
+		errs = append(errs, errors.New("PULL_TIMEOUT_SEC and LOG_MAX_BYTES must be at least 1"))
 	}
 	if c.MaxHTTPInflight < 1 || c.MaxContainers < 1 {
 		errs = append(errs, errors.New("MAX_HTTP_INFLIGHT and MAX_CONTAINERS must be at least 1"))
@@ -170,6 +173,19 @@ func (r *reader) hexKey(name string) []byte {
 		return nil
 	}
 	return key
+}
+
+// trustedProxies is required: unset, every public caller would share the
+// proxy's lockout bucket. "none" opts out when nothing proxies the runner.
+func (r *reader) trustedProxies() []netip.Prefix {
+	switch strings.ToLower(r.str("TRUSTED_PROXIES", "")) {
+	case "":
+		r.errs = append(r.errs, errors.New("TRUSTED_PROXIES is required: the address of the reverse proxy (the default network's gateway), or none"))
+		return nil
+	case "none":
+		return nil
+	}
+	return r.prefixes("TRUSTED_PROXIES")
 }
 
 // prefixes reads a comma-separated list of CIDRs or bare IPs.

@@ -178,7 +178,8 @@ func (e *Engine) finalize(r model.Run, from []model.Status, o outcome) bool {
 				}
 			}
 			if jobDone {
-				if err := store.SetJobState(ctx, tx, r.JobID, model.JobDone, now); err != nil {
+				// The job may have been deleted since; its run still finalizes.
+				if err := store.SetJobState(ctx, tx, r.JobID, model.JobDone, now); err != nil && !errors.Is(err, store.ErrNotFound) {
 					return err
 				}
 			}
@@ -196,8 +197,13 @@ func (e *Engine) finalize(r model.Run, from []model.Status, o outcome) bool {
 		return false
 	default:
 		e.log.Error("finalize write failed; holding result in memory", "run", r.ID, "status", o.status, "outcome", fmt.Sprintf("%+v", o), "err", err)
-		e.addUnflushed(r, write)
-		e.page(r, notify.Fail, "db write failing", "A run result could not be saved: "+err.Error())
+		if e.isUnflushed(r.ID) {
+			return false // already held; the first result wins
+		}
+		if len(e.unflushed) == 0 { // page once per outage, not per run
+			e.page(r, notify.Fail, "db write failing", "A run result could not be saved: "+err.Error())
+		}
+		e.addUnflushed(r, o.status, write, func() { e.afterFinalize(r, o, jobDone, skips, from) })
 		return false
 	}
 	e.afterFinalize(r, o, jobDone, skips, from)
@@ -271,16 +277,16 @@ func (e *Engine) notifyAwaiters(r model.Run) {
 	delete(e.awaiters, r.ChainRootID)
 }
 
-func (e *Engine) addUnflushed(r model.Run, write func(ctx context.Context) error) {
+func (e *Engine) addUnflushed(r model.Run, to model.Status, write func(ctx context.Context) error, after func()) {
 	e.unflushed = append(e.unflushed, &unflushed{
-		op: write, runID: r.ID, desc: string(r.Status), nextTry: e.now().Add(100 * time.Millisecond), backoff: 100 * time.Millisecond,
+		op: write, after: after, runID: r.ID, desc: string(to), nextTry: e.now().Add(100 * time.Millisecond), backoff: 100 * time.Millisecond,
 	})
 	e.unflushedCount.Store(int64(len(e.unflushed)))
 }
 
 // retryUnflushed retries held results from the loop timer, never sleeping.
-// Slots stay held until the write lands; the run is then reloaded and its
-// post-commit work done.
+// Slots stay held until the write lands, then finalize's post-commit work
+// runs. A stale write means another path finalized the run and owns that work.
 func (e *Engine) retryUnflushed(now time.Time) {
 	kept := e.unflushed[:0]
 	for _, u := range e.unflushed {
@@ -289,15 +295,11 @@ func (e *Engine) retryUnflushed(now time.Time) {
 			continue
 		}
 		err := u.op(e.life)
-		if err == nil || errors.Is(err, errStaleTransition) {
-			if r, gerr := store.GetRun(e.life, e.st.W, u.runID); gerr == nil {
-				e.release(r.ID)
-				e.stopLease(r.ID)
-				e.notifyAwaiters(r)
-				if s, serr := store.ChainLatest(e.life, e.st.W, r.ChainRootID); serr == nil && s.ID != r.ID && s.Status == model.StatusPending {
-					e.push(s.ID, s.ScheduledFor)
-				}
-			}
+		switch {
+		case err == nil:
+			u.after()
+			continue
+		case errors.Is(err, errStaleTransition):
 			continue
 		}
 		u.backoff = min(u.backoff*2, 30*time.Second)

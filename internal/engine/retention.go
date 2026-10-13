@@ -45,8 +45,12 @@ func (e *Engine) RunRetention(ctx context.Context) error {
 			fast = append(fast, j.ID)
 		}
 	}
-	if err := e.pruneRuns(ctx, now.AddDate(0, 0, -7), fast); err != nil {
-		return err
+	// nil would mean every job: with no sub-minute jobs there is nothing to
+	// prune early.
+	if len(fast) > 0 {
+		if err := e.pruneRuns(ctx, now.AddDate(0, 0, -7), fast); err != nil {
+			return err
+		}
 	}
 	if err := e.pruneRuns(ctx, now.AddDate(0, 0, -max(e.d.RetentionDays, 1)), nil); err != nil {
 		return err

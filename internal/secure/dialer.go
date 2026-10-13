@@ -16,22 +16,43 @@ import (
 var ErrBlockedAddress = errors.New("destination address is not allowed")
 
 // IPAllowed applies the callback IP policy to the resolved address.
-//   - Loopback, link-local (including cloud metadata), unspecified and
-//     multicast addresses are always refused.
-//   - Private and ULA addresses are allowed only for single-label hosts
-//     (docker service names such as "reel-drop"). A dotted public name that
-//     resolves privately is treated as DNS rebinding and refused.
+//   - Loopback, link-local (including cloud metadata), unspecified,
+//     multicast and special-use ranges (this-network, reserved, benchmark,
+//     NAT64, 6to4) are always refused.
+//   - Private, ULA and CGNAT addresses are allowed only for single-label
+//     hosts (docker service names such as "reel-drop"). A dotted name or an
+//     IP literal that lands there is refused, which also defeats DNS rebinding.
 func IPAllowed(host string, ip netip.Addr) bool {
 	ip = ip.Unmap()
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() ||
 		ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
 		return false
 	}
-	if ip.IsPrivate() && strings.Contains(strings.TrimSuffix(host, "."), ".") {
+	for _, p := range alwaysBlocked {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	host = strings.TrimSuffix(host, ".")
+	_, literalErr := netip.ParseAddr(host)
+	singleLabel := host != "" && literalErr != nil && !strings.Contains(host, ".")
+	if (ip.IsPrivate() || cgnat.Contains(ip)) && !singleLabel {
 		return false
 	}
 	return true
 }
+
+var (
+	cgnat         = netip.MustParsePrefix("100.64.0.0/10")
+	alwaysBlocked = []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("240.0.0.0/4"), // reserved and broadcast
+		netip.MustParsePrefix("64:ff9b::/96"),
+		netip.MustParsePrefix("64:ff9b:1::/48"),
+		netip.MustParsePrefix("2002::/16"),
+	}
+)
 
 // IPPolicy decides whether host may connect to ip. Production uses IPAllowed.
 type IPPolicy func(host string, ip netip.Addr) bool
@@ -45,7 +66,12 @@ func NewDialer(timeout time.Duration, allow IPPolicy) *net.Dialer {
 		KeepAlive: 30 * time.Second,
 		ControlContext: func(ctx context.Context, _, address string, _ syscall.RawConn) error {
 			hostPort, _ := ctx.Value(dialHostKey{}).(string)
-			host, _, _ := net.SplitHostPort(hostPort)
+			host, _, err := net.SplitHostPort(hostPort)
+			if err != nil || host == "" {
+				// Without the requested name the policy can't tell a docker
+				// service from a rebound public name: fail closed.
+				return fmt.Errorf("%w: dial without a requested host", ErrBlockedAddress)
+			}
 			ipStr, _, err := net.SplitHostPort(address)
 			if err != nil {
 				return err

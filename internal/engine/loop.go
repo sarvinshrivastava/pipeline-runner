@@ -107,6 +107,9 @@ func (e *Engine) loop() {
 		now := e.now()
 		e.loopAt.Store(now.UnixMilli())
 		if e.draining && (e.inflight[poolHTTP] == 0 || !now.Before(e.drainBy)) {
+			if n := len(e.unflushed); n > 0 {
+				e.log.Error("shutting down with unsaved run results; boot recovery will resolve them", "count", n)
+			}
 			e.accepting.Store(false)
 			close(e.drainDone)
 			return
@@ -296,6 +299,11 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 		return // ghost: deleted or no longer pending
 	}
 	spec, err := e.spec(r)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		e.log.Error("load run spec; retrying", "run", runID, "err", err)
+		e.push(runID, now.Add(time.Second))
+		return
+	}
 	if err != nil {
 		e.log.Error("load run spec", "run", runID, "err", err)
 		e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusFailed, err: "run specification missing", page: true})
@@ -304,6 +312,18 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 	var je *jobEntry
 	if r.JobID != "" {
 		je = e.jobs[r.JobID]
+		if je == nil {
+			// The cache misses a job whose change event was lost; reconcile
+			// would add it within a minute, so check the store before cancelling.
+			switch j, err := store.GetJob(ctx, e.st.W, r.JobID); {
+			case err == nil:
+				je = newJobEntry(j, now)
+				e.jobs[j.ID] = je
+			case !errors.Is(err, store.ErrNotFound):
+				e.push(runID, now.Add(time.Second))
+				return
+			}
+		}
 		if je == nil && r.Kind != model.KindAdhoc {
 			e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusCancelled, err: "job deleted"})
 			return
@@ -461,6 +481,9 @@ func (e *Engine) unpark(runID string) {
 // wake admits runs from the head of a wait list while they can run. Ghost
 // heads are popped in a loop so they never use up a wake.
 func (e *Engine) wake(list string) {
+	if e.draining {
+		return // no new dispatch during shutdown; boot recovery takes them
+	}
 	now := e.now()
 	for {
 		ids := e.waits[list]

@@ -253,6 +253,60 @@ func TestPatchTriggerChanged(t *testing.T) {
 	}
 }
 
+func TestPatchTriggerTypeRederivesDefaultOverlap(t *testing.T) {
+	cur, err := ValidateJobCreate(httpJob(), ctx()) // cron: default overlap skip
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := ValidatePatch(cur, JobPatch{Trigger: &TriggerIn{Type: TriggerInvoke}}, ctx())
+	if err != nil || next.Policy.Overlap != OverlapAllow {
+		t.Fatalf("cron->invoke keeps default overlap: %v %v", next.Policy.Overlap, err)
+	}
+	in := httpJob()
+	in.Policy = &PolicyIn{Overlap: ptr(OverlapQueue)}
+	explicit, err := ValidateJobCreate(in, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err = ValidatePatch(explicit, JobPatch{Trigger: &TriggerIn{Type: TriggerInvoke}}, ctx())
+	if err != nil || next.Policy.Overlap != OverlapQueue {
+		t.Fatalf("explicit overlap must survive a trigger change: %v %v", next.Policy.Overlap, err)
+	}
+}
+
+func TestPatchAtPolicyRechecksJitter(t *testing.T) {
+	in := httpJob()
+	at := time.Now().Add(time.Hour)
+	in.Trigger = TriggerIn{Type: TriggerAt, At: &at}
+	cur, err := ValidateJobCreate(in, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = ValidatePatch(cur, JobPatch{Policy: &PolicyIn{JitterSec: ptr(int64(30)), MaxLateSec: ptr(int64(30))}}, ctx())
+	if err == nil {
+		t.Fatal("jitter >= max_late_sec accepted on an at job")
+	}
+}
+
+func TestRunnerSecretsAndCleartextAuthRefused(t *testing.T) {
+	c := ctx()
+	c.Principal.SecretRefPrefixes = []string{"Root/"}
+	if _, err := CheckRef("Root/PIPELINE_RUNNER_API_TOKEN", c.Principal); err == nil {
+		t.Fatal("runner's own secret accepted")
+	}
+	in := httpJob()
+	c = ctx()
+	c.Principal.CallbackHosts = []string{"api.example.com"}
+	in.Target.HTTP.URL = "http://api.example.com/hook"
+	if _, err := ValidateJobCreate(in, c); err == nil {
+		t.Fatal("bearer over cleartext http to a public host accepted")
+	}
+	in.Target.HTTP.URL = "https://api.example.com/hook"
+	if _, err := ValidateJobCreate(in, c); err != nil {
+		t.Fatalf("https: %v", err)
+	}
+}
+
 func TestNSKey(t *testing.T) {
 	in := httpJob()
 	in.Policy = &PolicyIn{ConcurrencyKey: ptr("ig:123")}

@@ -15,12 +15,14 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/sarvinshrivastava/pipeline-runner/internal/metrics"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/secure"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/target"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/vault"
@@ -85,6 +87,9 @@ type Deps struct {
 	ContainersEnabled bool
 	Containers        ContainerRuntime
 	Rand              func(n int64) int64 // jitter source; defaults to math/rand
+	// CallbackPolicy is the dial-time IP policy; the validate checks apply
+	// it to the resolved callback host. nil skips that check.
+	CallbackPolicy secure.IPPolicy
 }
 
 type held struct {
@@ -100,6 +105,7 @@ type jobEntry struct {
 
 type unflushed struct {
 	op      func(ctx context.Context) error
+	after   func() // the post-commit work finalize would have done
 	runID   string
 	desc    string
 	nextTry time.Time
@@ -115,6 +121,8 @@ type Engine struct {
 	events   chan event
 	life     context.Context
 	stopLife context.CancelFunc
+	stopping chan struct{} // closed when Stop begins; releases ?wait callers
+	stopOnce sync.Once
 	loopAt   atomic.Int64
 	done     chan struct{}
 
@@ -131,6 +139,7 @@ type Engine struct {
 	revs            map[revKey]model.RunSpec
 	awaiters        map[string][]chan model.Run
 	leaseGen        map[string]uint64
+	leaseSeq        uint64 // never reused, so a stale expiry can't match a re-arm
 	leaseTimers     map[string]Timer
 	cancelFns       map[string]context.CancelFunc
 	cancelRequested map[string]bool
@@ -160,7 +169,7 @@ func New(d Deps) *Engine {
 	life, stop := context.WithCancel(context.Background())
 	e := &Engine{
 		d: d, st: d.Store, log: d.Log,
-		events: make(chan event, 1024), life: life, stopLife: stop, done: make(chan struct{}),
+		events: make(chan event, 1024), life: life, stopLife: stop, done: make(chan struct{}), stopping: make(chan struct{}),
 		inHeap: map[string]int{}, parked: map[string]string{}, waits: map[string][]string{},
 		held: map[string]held{}, jobBusy: map[string]int{}, keyBusy: map[string]int{}, inflight: map[string]int{},
 		jobs: map[string]*jobEntry{}, revs: map[revKey]model.RunSpec{}, awaiters: map[string][]chan model.Run{},
@@ -186,6 +195,7 @@ func (e *Engine) Healthy() bool { return e.LoopAge() < 60*time.Second }
 // Stop drains: no new dispatch, in-flight HTTP runs get until drainBy, then
 // results are ignored and boot recovery owns any run still marked running.
 func (e *Engine) Stop(ctx context.Context, drainBy time.Time) {
+	e.stopOnce.Do(func() { close(e.stopping) })
 	done := make(chan struct{})
 	if err := e.send(ctx, evShutdown{drainBy: drainBy, done: done}); err == nil {
 		select {

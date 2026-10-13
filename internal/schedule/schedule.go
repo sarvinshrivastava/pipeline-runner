@@ -34,7 +34,6 @@ type Schedule struct {
 	spec      *cron.SpecSchedule // nil for @every
 	loc       *time.Location
 	wallClock bool
-	seconds   bool // the expression has a seconds field
 }
 
 // Parse parses expr and binds it to the IANA zone tz ("" means UTC).
@@ -60,7 +59,7 @@ func Parse(expr, tz string) (Schedule, error) {
 		spec.Location = loc
 		s.spec = spec
 	}
-	s.wallClock, s.seconds = classify(expr)
+	s.wallClock = classify(expr)
 	return s, nil
 }
 
@@ -80,29 +79,28 @@ func LoadLocation(tz string) (*time.Location, error) {
 	return loc, nil
 }
 
-// classify reports whether the hour field is a fixed list, and whether the
-// expression carries a seconds field.
-func classify(expr string) (wallClock, seconds bool) {
+// classify reports whether the hour field is a fixed list of wall-clock
+// hours. Only "every hour" follows absolute instants; ranges and steps
+// (9-17/2, */3) name fixed local hours.
+func classify(expr string) (wallClock bool) {
 	if strings.HasPrefix(expr, "@") {
 		switch strings.ToLower(expr) {
 		case "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight":
-			return true, false
+			return true
 		}
-		// @hourly and @every follow absolute instants. @every can be sub-minute.
-		return false, strings.HasPrefix(strings.ToLower(expr), "@every")
+		return false // @hourly and @every follow absolute instants
 	}
 	fields := strings.Fields(expr)
 	hourIdx := 1
 	if len(fields) == 6 {
 		hourIdx = 2
-		seconds = true
 	}
-	hour := fields[hourIdx]
-	return !strings.ContainsAny(hour, "*/?"), seconds
+	switch fields[hourIdx] {
+	case "*", "?", "*/1":
+		return false
+	}
+	return true
 }
-
-// HasSeconds reports whether the expression can fire more than once a minute.
-func (s Schedule) HasSeconds() bool { return s.seconds }
 
 // Next returns the first fire instant strictly after `after`, in UTC, or the
 // zero time when there is none within the scan bound.

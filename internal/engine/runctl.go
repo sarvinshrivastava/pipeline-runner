@@ -23,8 +23,11 @@ func (e *Engine) execute(ctx context.Context, r model.Run, spec model.RunSpec) t
 		return target.Result{Status: model.StatusFailed, Error: msg, Unsent: unsent, NoRetry: !unsent}
 	}
 	c, err := store.GetClient(ctx, e.st.R, r.ClientID)
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		return fail("owning client no longer exists", false)
+	}
+	if err != nil {
+		return fail("could not load the owning client: "+err.Error(), true) // nothing sent; retry is safe
 	}
 	p := model.PrincipalOf(c)
 	if h := spec.Target.HTTP; h != nil {
@@ -72,12 +75,22 @@ func (e *Engine) onExecDone(runID string, res target.Result) {
 	}
 	delete(e.cancelFns, runID)
 	r, err := store.GetRun(e.life, e.st.W, runID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		e.log.Error("load run on exec done; retrying", "run", runID, "err", err)
+		e.redeliver(runID, res)
+		return
+	}
 	if err != nil || r.Status != model.StatusRunning {
 		return
 	}
 	spec, err := e.spec(r)
+	if errors.Is(err, store.ErrNotFound) {
+		e.finalize(r, []model.Status{model.StatusRunning}, outcome{status: model.StatusFailed, err: "run specification missing", page: true})
+		return
+	}
 	if err != nil {
-		e.log.Error("load spec on exec done", "run", runID, "err", err)
+		e.log.Error("load spec on exec done; retrying", "run", runID, "err", err)
+		e.redeliver(runID, res)
 		return
 	}
 	running := []model.Status{model.StatusRunning}
@@ -106,10 +119,12 @@ func (e *Engine) onExecDone(runID string, res target.Result) {
 		ok, err := store.Transition(e.life, e.st.W, r.ID, running, model.StatusWaiting, store.Fields{
 			"lease_expires_at": lease, "http_status": 202, "delivery_attempted": true,
 		})
-		if err != nil || !ok {
-			if err != nil {
-				e.log.Error("mark waiting", "run", r.ID, "err", err)
-			}
+		if err != nil {
+			e.log.Error("mark waiting; retrying", "run", r.ID, "err", err)
+			e.redeliver(runID, res)
+			return
+		}
+		if !ok {
 			return
 		}
 		e.releasePool(r.ID)
@@ -117,6 +132,12 @@ func (e *Engine) onExecDone(runID string, res target.Result) {
 		return
 	}
 	e.finalize(r, running, e.decide(r, spec, res, now))
+}
+
+// redeliver re-queues an executor result whose bookkeeping hit a transient
+// DB error, so the run doesn't stay running with its slots held.
+func (e *Engine) redeliver(runID string, res target.Result) {
+	e.d.Clock.AfterFunc(time.Second, func() { _ = e.send(e.life, evExecDone{runID: runID, res: res}) })
 }
 
 // fromComplete maps an async completion into an outcome.
@@ -141,7 +162,8 @@ func (e *Engine) fromComplete(r model.Run, spec model.RunSpec, cr model.Complete
 
 func (e *Engine) armLease(runID string, expires time.Time) {
 	e.stopLease(runID)
-	gen := e.leaseGen[runID] + 1
+	e.leaseSeq++
+	gen := e.leaseSeq
 	e.leaseGen[runID] = gen
 	e.leaseTimers[runID] = e.d.Clock.AfterFunc(max(expires.Sub(e.now()), 0), func() {
 		_ = e.send(e.life, evLeaseExpired{runID: runID, gen: gen})
@@ -162,11 +184,20 @@ func (e *Engine) onLeaseExpired(runID string, gen uint64) {
 	}
 	delete(e.leaseTimers, runID)
 	r, err := store.GetRun(e.life, e.st.W, runID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		e.armLease(runID, e.now().Add(time.Second)) // transient: look again shortly
+		return
+	}
 	if err != nil || r.Status != model.StatusWaiting {
 		return
 	}
 	spec, err := e.spec(r)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		e.armLease(runID, e.now().Add(time.Second))
+		return
+	}
 	if err != nil {
+		e.finalize(r, []model.Status{model.StatusWaiting}, outcome{status: model.StatusFailed, err: "run specification missing", page: true})
 		return
 	}
 	now := e.now()
@@ -174,6 +205,14 @@ func (e *Engine) onLeaseExpired(runID string, gen uint64) {
 		e.finalize(r, []model.Status{model.StatusWaiting}, e.decide(r, spec, target.Result{
 			Status: model.StatusTimeout, Error: "async run exceeded timeout_sec", Ambiguous: true, Delivered: true,
 		}, now))
+		return
+	}
+	if r.LeaseExpiresAt != nil && now.Before(*r.LeaseExpiresAt) {
+		at := *r.LeaseExpiresAt // a heartbeat extended it since
+		if r.DeadlineAt != nil && r.DeadlineAt.Before(at) {
+			at = *r.DeadlineAt
+		}
+		e.armLease(runID, at)
 		return
 	}
 	o := e.decide(r, spec, target.Result{Status: model.StatusInterrupted, Error: "lease expired without heartbeat or completion", Ambiguous: true, Delivered: true}, now)
@@ -196,6 +235,7 @@ func (e *Engine) cancelRun(runID string) (model.Run, bool, error) {
 	switch r.Status {
 	case model.StatusPending:
 		e.unpark(r.ID)
+		delete(e.inHeap, r.ID) // its heap entry is a ghost from now on
 		e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusCancelled, err: "cancelled"})
 	case model.StatusWaiting:
 		e.finalize(r, []model.Status{model.StatusWaiting}, outcome{status: model.StatusCancelled, err: "cancelled"})
@@ -306,10 +346,12 @@ func (e *Engine) heartbeat(runID string) (model.Run, *time.Time, error) {
 }
 
 func (e *Engine) onJobChanged(v evJobChanged) {
+	gone := false
 	switch j, err := store.GetJob(e.life, e.st.W, v.jobID); {
 	case v.deleted || errors.Is(err, store.ErrNotFound):
 		// A create event can arrive after the job was already deleted.
 		delete(e.jobs, v.jobID)
+		gone = true
 	case err != nil:
 		e.log.Error("reload job", "job", v.jobID, "err", err)
 	default:
@@ -333,6 +375,12 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 	for _, id := range v.dropped {
 		delete(e.inHeap, id)
 		e.unpark(id)
+		if r, err := store.GetRun(e.life, e.st.W, id); err == nil && r.Status.Terminal() {
+			e.notifyAwaiters(r) // ?wait callers on a cancelled chain
+		}
+	}
+	if gone {
+		return // runs it inserted were cancelled with it
 	}
 	for _, r := range v.inserted {
 		e.push(r.ID, r.ScheduledFor)

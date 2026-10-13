@@ -16,8 +16,8 @@ class ApiError extends Error {
   constructor(status, code, message) { super(message); this.status = status; this.code = code; }
 }
 
-async function api(method, path, body) {
-  const opts = { method, headers: { Authorization: "Bearer " + token() } };
+async function api(method, path, body, headers = {}) {
+  const opts = { method, headers: { Authorization: "Bearer " + token(), ...headers } };
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = typeof body === "string" ? body : JSON.stringify(body);
@@ -84,7 +84,7 @@ async function loadJobs() {
       el("div", { class: "pipeline-top" },
         el("span", { class: "pipeline-name" }, j.name), pill(j.state),
         el("div", { class: "pipeline-actions" },
-          el("button", { class: "btn btn-sm", type: "button", onclick: () => act("POST", `/v1/jobs/${j.id}/invoke`) }, "Run now"),
+          el("button", { class: "btn btn-sm", type: "button", onclick: (ev) => act("POST", `/v1/jobs/${j.id}/invoke`, ev.currentTarget) }, "Run now"),
           j.state === "disabled"
             ? el("button", { class: "btn btn-sm", type: "button", onclick: () => act("POST", `/v1/jobs/${j.id}/enable`) }, "Enable")
             : el("button", { class: "btn btn-sm", type: "button", onclick: () => act("POST", `/v1/jobs/${j.id}/disable`) }, "Disable"),
@@ -141,8 +141,13 @@ async function loadClients() {
 
 // ---------------------------------------------------------------- actions
 
-async function act(method, path) {
-  try { await api(method, path); } catch (e) { alertError(e); }
+// act sends one request per click: the button is disabled while it is in
+// flight, and POSTs carry an Idempotency-Key so a retried request can't run twice.
+async function act(method, path, button) {
+  if (button) button.disabled = true;
+  const headers = method === "POST" ? { "Idempotency-Key": crypto.randomUUID() } : {};
+  try { await api(method, path, undefined, headers); } catch (e) { alertError(e); }
+  if (button) button.disabled = false;
   refresh();
 }
 
@@ -175,7 +180,8 @@ function showRuns(jobId) {
 }
 
 async function openRun(id) {
-  const run = await api("GET", `/v1/runs/${id}`);
+  let run;
+  try { run = await api("GET", `/v1/runs/${id}`); } catch (e) { alertError(e); return; }
   $("run-title").textContent = `${run.job_name} · ${run.status}`;
   $("run-json").textContent = JSON.stringify(run, null, 2);
   $("log-body").textContent = "loading…";
@@ -292,6 +298,8 @@ document.addEventListener("DOMContentLoaded", () => {
     $("client-dialog").showModal();
   });
   $("client-cancel").addEventListener("click", () => $("client-dialog").close());
+  // A shown-once token must not stay in the DOM after its dialog closes.
+  $("client-dialog").addEventListener("close", () => { $("client-report").textContent = ""; });
   $("client-save").addEventListener("click", saveClient);
   $("run-close").addEventListener("click", () => $("run-dialog").close());
 

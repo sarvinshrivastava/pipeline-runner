@@ -70,9 +70,17 @@ func (x *Executor) Execute(ctx context.Context, in target.ExecInput) target.Resu
 		return target.Result{Status: model.StatusFailed, Error: "encode body: " + err.Error(), NoRetry: true}
 	}
 
+	for _, ref := range []string{h.Auth.BearerRef, h.Auth.HMACRef} {
+		if ref != "" && in.Secrets[ref] == "" {
+			return target.Result{Status: model.StatusFailed, Error: "secret " + ref + " resolved empty", Unsent: true, NoRetry: true}
+		}
+	}
 	var reqBody io.Reader
+	signed := body // the signature covers exactly the bytes sent
 	if h.Method != http.MethodGet {
 		reqBody = bytes.NewReader(body)
+	} else {
+		signed = nil
 	}
 	var wrote atomic.Bool
 	trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) }}
@@ -98,7 +106,7 @@ func (x *Executor) Execute(ctx context.Context, in target.ExecInput) target.Resu
 		req.Header.Set("Authorization", "Bearer "+in.Secrets[h.Auth.BearerRef])
 	}
 	if h.Auth.HMACRef != "" {
-		req.Header.Set("X-PLR-Signature", secure.Sign([]byte(in.Secrets[h.Auth.HMACRef]), strconv.FormatInt(x.Now().Unix(), 10), body))
+		req.Header.Set("X-PLR-Signature", secure.Sign([]byte(in.Secrets[h.Auth.HMACRef]), strconv.FormatInt(x.Now().Unix(), 10), signed))
 	}
 	log.printf("→ %s %s (attempt %d, %s)\n", h.Method, h.URL, r.Attempt, r.Kind)
 	log.printf("  headers: %s\n", headerNames(req.Header))
@@ -117,12 +125,14 @@ func (x *Executor) Execute(ctx context.Context, in target.ExecInput) target.Resu
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, model.MaxOutputBytes+1))
+	// Read past the cap and redact before cutting, so a secret straddling the
+	// cut can't leave its prefix behind.
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, model.MaxOutputBytes+redactMargin+1))
 	truncated := len(raw) > model.MaxOutputBytes
-	if truncated {
+	raw = red.Bytes(raw)
+	if len(raw) > model.MaxOutputBytes {
 		raw = raw[:model.MaxOutputBytes]
 	}
-	raw = red.Bytes(raw)
 	code := resp.StatusCode
 	log.printf("← %d after %s\n", code, time.Since(start).Round(time.Millisecond))
 	if n := min(len(raw), 4096); n > 0 {
@@ -202,6 +212,7 @@ func asJSON(raw []byte, truncated bool) json.RawMessage {
 // deferUntil reads {"defer_until": "<RFC 3339>"}. bad reports a present but
 // unparseable value.
 func deferUntil(raw []byte, truncated bool) (t time.Time, ok, bad bool) {
+	raw = bytes.TrimLeft(raw, " \t\r\n\ufeff")
 	if truncated || len(raw) == 0 || raw[0] != '{' {
 		return t, false, false
 	}
@@ -218,6 +229,12 @@ func deferUntil(raw []byte, truncated bool) (t time.Time, ok, bad bool) {
 	return t.UTC(), true, false
 }
 
+// redactMargin is read beyond MaxOutputBytes so redaction sees whole secrets.
+const redactMargin = 4096
+
+// maxRetryAfterSec caps delta-seconds before the Duration multiply can overflow.
+const maxRetryAfterSec = 366 * 86400
+
 // retryAfter parses delta-seconds or an HTTP-date.
 func retryAfter(v string, now time.Time) (time.Time, bool) {
 	v = strings.TrimSpace(v)
@@ -225,6 +242,7 @@ func retryAfter(v string, now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		secs = min(secs, maxRetryAfterSec) // max_defer_sec rejects anything later anyway
 		return now.Add(time.Duration(secs) * time.Second).UTC(), true
 	}
 	if t, err := http.ParseTime(v); err == nil {
