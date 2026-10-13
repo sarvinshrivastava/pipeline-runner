@@ -26,8 +26,8 @@ import (
 // TestFireDelayP99 is acceptance #1: 100 pending `at` HTTP jobs fire with a
 // p99 delay under 50 ms, measured at the receiver (so HTTP time is included).
 func TestFireDelayP99(t *testing.T) {
-	if testing.Short() {
-		t.Skip("real-clock precision test")
+	if testing.Short() || raceEnabled {
+		t.Skip("timing assertion: run without -race and -short (CI runs it alone)")
 	}
 	var mu sync.Mutex
 	var delays []time.Duration

@@ -590,3 +590,21 @@ func TestShutdownIgnoresResultsAfterDrain(t *testing.T) {
 	}
 	h.e = nil
 }
+
+// TestHealthStall is acceptance #8: a loop that stops iterating reads as
+// unhealthy within 60 s.
+func TestHealthStall(t *testing.T) {
+	h := newHarness(t)
+	if !h.e.Healthy() {
+		t.Fatal("fresh engine unhealthy")
+	}
+	release := make(chan struct{})
+	go func() { _ = h.e.send(context.Background(), evCall{f: func() { <-release }, done: make(chan struct{})}) }()
+	time.Sleep(50 * time.Millisecond) // the loop is now blocked
+	h.clk.Advance(61 * time.Second)
+	if h.e.Healthy() {
+		t.Fatal("stalled loop still healthy")
+	}
+	close(release)
+	h.waitFor("healthy again", h.e.Healthy)
+}
