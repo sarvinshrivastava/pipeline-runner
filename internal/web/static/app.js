@@ -53,7 +53,7 @@ const STATUS_PILL = {
   skipped: "pill-muted", cancelled: "pill-muted", running: "pill-info", waiting: "pill-info", pending: "pill-muted",
   deferred: "pill-muted", active: "pill-ok", disabled: "pill-muted", done: "pill-muted",
 };
-const pill = (s) => el("span", { class: "pill " + (STATUS_PILL[s] || "pill-muted") }, s);
+const pill = (s) => el("span", { class: `pill ${STATUS_PILL[s] || "pill-muted"}` }, s);
 const fmt = (t) => (t ? new Date(t).toLocaleString() : "—");
 
 function describeTrigger(t) {
@@ -80,7 +80,7 @@ async function loadJobs() {
     filter.append(el("option", { value: j.id }, j.name));
     const target = JSON.parse(JSON.stringify(j.target));
     const where = target.http ? target.http.url : target.type;
-    box.append(el("div", { class: "pipeline" + (j.state !== "active" ? " disabled-row" : "") },
+    box.append(el("div", { class: `pipeline${j.state !== "active" ? " disabled-row" : ""}` },
       el("div", { class: "pipeline-top" },
         el("span", { class: "pipeline-name" }, j.name), pill(j.state),
         el("div", { class: "pipeline-actions" },
@@ -110,11 +110,11 @@ async function loadRuns() {
     el("td", {}, r.job_name), el("td", {}, pill(r.status)), el("td", {}, r.trigger + (r.attempt > 1 ? ` #${r.attempt}` : "")),
     el("td", {}, fmt(r.scheduled_for)), el("td", {}, r.late_ms != null ? r.late_ms + " ms" : "—"),
     el("td", {}, r.http_status != null ? r.http_status : (r.exit_code != null ? "exit " + r.exit_code : "—")),
-    el("td", { class: "row-actions" },
+    el("td", {}, el("div", { class: "row-actions" },
       el("button", { class: "btn btn-sm", type: "button", onclick: () => openRun(r.id) }, "Details"),
       ["pending", "running", "waiting"].includes(r.status)
         ? el("button", { class: "btn btn-sm", type: "button", onclick: () => act("POST", `/v1/runs/${r.id}/cancel`) }, "Cancel")
-        : null)));
+        : null))));
   box.append(el("table", {},
     el("thead", {}, el("tr", {}, ...["Job", "Status", "Trigger", "Scheduled", "Late", "Result", ""].map((h) => el("th", {}, h)))),
     el("tbody", {}, ...rows)));
@@ -132,8 +132,8 @@ async function loadClients() {
   const rows = data.items.map((c) => el("tr", {},
     el("td", {}, c.name), el("td", {}, c.scopes.join(", ")), el("td", {}, c.callback_hosts.join(", ")),
     el("td", {}, c.secret_ref_prefixes.join(", ")), el("td", {}, c.container_allowed ? "yes" : "no"),
-    el("td", { class: "row-actions" },
-      el("button", { class: "btn btn-sm", type: "button", onclick: () => rotate(c) }, "Rotate token"))));
+    el("td", {}, el("div", { class: "row-actions" },
+      el("button", { class: "btn btn-sm", type: "button", onclick: () => rotate(c) }, "Rotate token")))));
   box.append(el("table", {},
     el("thead", {}, el("tr", {}, ...["Name", "Scopes", "Callback hosts", "Secret prefixes", "Containers", ""].map((h) => el("th", {}, h)))),
     el("tbody", {}, ...rows)));
@@ -247,7 +247,7 @@ async function health() {
   try {
     const r = await fetch("/healthz");
     const d = await r.json();
-    h.className = "pill " + (d.ok ? "pill-ok" : "pill-bad");
+    h.className = `pill ${d.ok ? "pill-ok" : "pill-bad"}`;
     h.textContent = d.ok ? "engine ok" : `engine stalled (${Math.round(d.loop_age_ms / 1000)}s)`;
   } catch { h.className = "pill pill-bad"; h.textContent = "unreachable"; }
 }
