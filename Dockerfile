@@ -1,19 +1,18 @@
-FROM oven/bun:1-alpine
+# Build: a static binary (pure-Go SQLite, no cgo) with tzdata embedded.
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+ARG GIT_SHA=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${GIT_SHA}" -o /plr ./cmd/plr
 
-# docker-cli: the runner spawns a sibling container per pipeline run via the
-# mounted host socket. git: clone/commit/push happen service-side so a
-# pipeline's container never sees the git token.
-RUN apk add --no-cache docker-cli git ca-certificates tzdata
-
-WORKDIR /app
-
-COPY package.json bun.lock* ./
-RUN bun install --production
-
-COPY src ./src
-COPY public ./public
-
-ENV PORT=3000
-EXPOSE 3000
-
-CMD ["bun", "run", "src/index.ts"]
+# Run: CA certs for HTTPS callbacks and git (used by container targets in 1b).
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates git
+COPY --from=build /plr /usr/local/bin/plr
+ENV PORT=3000 METRICS_PORT=9464
+EXPOSE 3000 9464
+ENTRYPOINT ["plr"]
+CMD ["serve"]

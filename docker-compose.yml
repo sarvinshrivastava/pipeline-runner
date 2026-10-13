@@ -1,42 +1,62 @@
+# Delivery 1a: HTTP time service. No docker socket is mounted; container and
+# inline targets (which need it) arrive in 1b.
 services:
   app:
-    build: .
-    container_name: ${SERVICE_NAME:-pipeline-runner}
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+    image: pipeline-runner:latest
+    container_name: pipeline-runner  # bridge-mcp's restart allowlist pins this name
     restart: unless-stopped
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "127.0.0.1:${APP_PORT:-3000}:3000"  # host nginx only; never 0.0.0.0
     env_file:
       - .env
     environment:
       - PORT=3000
-      - SERVICE_NAME=${SERVICE_NAME:-pipeline-runner}
+      - METRICS_PORT=9464
       - DATA_DIR=${HOST_DATA_DIR:-/root/pipeline-runner-data}
-
     volumes:
-      # Bind mount using the SAME path inside and outside the container.
-      # `docker run -v` args we generate are resolved by the HOST daemon, so a
-      # workspace path must be valid on the host as well as in here. A named
-      # volume would break this.
       - ${HOST_DATA_DIR:-/root/pipeline-runner-data}:${HOST_DATA_DIR:-/root/pipeline-runner-data}
-      # Highest-privilege mount in this file: full Docker API access is
-      # equivalent to host root. Every route is therefore token-gated, and
-      # pipelines may only supply an image + command, never docker flags.
-      - /var/run/docker.sock:/var/run/docker.sock
-
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 256
+    networks:
+      default:
+        gw_priority: 100  # published-port traffic arrives from this gateway (TRUSTED_PROXIES)
+      shared: {}
+      secrets-manager_default: {}
+      monitoring_monitoring: {}
     labels:
       autoheal: "true"
-
     healthcheck:
-      # A scheduler cannot page about its own death; /healthz 503s once the
-      # tick loop stalls, which is what makes the failure externally visible.
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
-      interval: 60s
+      # The engine loop must keep iterating; /healthz 503s within 60 s of a stall.
+      test: ["CMD", "plr", "healthcheck"]
+      interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
-
+    stop_grace_period: 30s  # 20 s drain for in-flight callbacks, then exit
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24  # gateway 172.31.250.1 → TRUSTED_PROXIES
+  shared:
+    external: true
+  secrets-manager_default:
+    external: true
+  monitoring_monitoring:
+    external: true
