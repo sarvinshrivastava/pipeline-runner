@@ -37,6 +37,10 @@ import (
 // version is stamped at build time with -ldflags "-X main.version=<sha>".
 var version = "dev"
 
+// callbackPolicy guards callback destinations. Only the in-process load test
+// replaces it (to reach a loopback receiver).
+var callbackPolicy secure.IPPolicy = secure.IPAllowed
+
 func main() {
 	cmd := "serve"
 	if len(os.Args) > 1 {
@@ -122,7 +126,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 		return eng.LoopAge().Seconds()
 	})
 	executors := map[string]target.Executor{
-		model.TargetHTTP: httpt.New(secure.NewHTTPClient(10*time.Second, secure.IPAllowed)),
+		model.TargetHTTP: httpt.New(secure.NewHTTPClient(10*time.Second, callbackPolicy)),
 	}
 	eng = engine.New(engine.Deps{
 		Store: st, Executors: executors, Secrets: vc, Pager: pager, Metrics: m, Log: log,
