@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -77,7 +78,7 @@ func (s *Server) loadRun(r *http.Request) (model.Run, error) {
 // one; a client may only act for itself.
 func (s *Server) owner(r *http.Request, clientName string) (model.Principal, error) {
 	p := principalFrom(r)
-	if !p.Admin || p.ClientID != "" {
+	if !isBootstrap(p) {
 		if clientName != "" && clientName != p.Name {
 			return model.Principal{}, &model.FieldError{Field: "client", Code: model.CodeForbidden, Message: "a client may only act for itself"}
 		}
@@ -129,6 +130,20 @@ func pageParams(w http.ResponseWriter, r *http.Request) (cursor string, limit in
 	return r.URL.Query().Get("cursor"), limit, true
 }
 
+// pageOf renders rows fetched with limit+1: the extra row only signals that
+// another page exists.
+func pageOf[T, D any](rows []T, limit int, id func(T) string, dto func(T) D) page[D] {
+	out := page[D]{Items: []D{}}
+	for i, row := range rows {
+		if i == limit {
+			out.NextCursor = id(rows[limit-1])
+			break
+		}
+		out.Items = append(out.Items, dto(row))
+	}
+	return out
+}
+
 // ---------------------------------------------------------------- health, status
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -174,8 +189,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalFrom(r)
 	clientID := p.ClientID
-	if p.Admin && p.ClientID == "" {
-		clientID = ""
+	if isBootstrap(p) {
 		if name := r.URL.Query().Get("client"); name != "" {
 			c, err := store.ClientByName(r.Context(), s.d.Store.R, name)
 			if err != nil {
@@ -190,15 +204,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		fail(w, s.d.Log, err)
 		return
 	}
-	out := page[JobDTO]{Items: []JobDTO{}}
-	for i, j := range jobs {
-		if i == limit {
-			out.NextCursor = jobs[limit-1].ID
-			break
-		}
-		out.Items = append(out.Items, jobDTO(j))
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, pageOf(jobs, limit, func(j model.Job) string { return j.ID }, jobDTO))
 }
 
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
@@ -448,7 +454,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalFrom(r)
 	f := store.RunFilter{JobID: r.URL.Query().Get("job"), Status: r.URL.Query().Get("status"), Cursor: cursor, Limit: limit + 1}
-	if !p.Admin || p.ClientID != "" {
+	if !isBootstrap(p) {
 		f.ClientID = p.ClientID
 	}
 	runs, err := store.ListRuns(r.Context(), s.d.Store.R, f)
@@ -456,15 +462,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		fail(w, s.d.Log, err)
 		return
 	}
-	out := page[RunDTO]{Items: []RunDTO{}}
-	for i, run := range runs {
-		if i == limit {
-			out.NextCursor = runs[limit-1].ID
-			break
-		}
-		out.Items = append(out.Items, runDTO(run))
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, pageOf(runs, limit, func(run model.Run) string { return run.ID }, runDTO))
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
@@ -587,7 +585,7 @@ func applyClient(c *model.Client, in clientIn) error {
 	bad := func(field, msg string) error { return &model.FieldError{Field: field, Code: "invalid", Message: msg} }
 	if in.Scopes != nil {
 		for _, sc := range *in.Scopes {
-			if !contains(model.AllScopes, sc) {
+			if !slices.Contains(model.AllScopes, sc) {
 				return bad("scopes", "unknown scope "+sc)
 			}
 		}
@@ -633,15 +631,6 @@ func applyClient(c *model.Client, in clientIn) error {
 		c.NtfyTopic = *in.NtfyTopic
 	}
 	return nil
-}
-
-func contains(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) listClients(w http.ResponseWriter, r *http.Request) {
@@ -784,7 +773,7 @@ func (s *Server) listSecrets(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		if (p.Admin && p.ClientID == "") || vault.Permitted(ref, p.SecretRefPrefixes) {
+		if isBootstrap(p) || vault.Permitted(ref, p.SecretRefPrefixes) {
 			names = append(names, k)
 		}
 	}

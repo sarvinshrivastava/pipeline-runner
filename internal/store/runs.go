@@ -18,7 +18,7 @@ const runCols = `id, job_id, job_name, client_id, trigger, attempt, parent_run_i
 	delivery_attempted, http_status, exit_code, output, output_truncated, output_error, error,
 	container_name, created_at`
 
-func scanRun(row interface{ Scan(...any) error }) (model.Run, error) {
+func scanRun(row scanner) (model.Run, error) {
 	var (
 		r                                                  model.Run
 		jobID, parent, adhoc, early, outErr, errStr, cname sql.NullString
@@ -232,22 +232,12 @@ func RunsByStatus(ctx context.Context, q Querier, statuses ...model.Status) ([]m
 	for i, s := range statuses {
 		args[i] = string(s)
 	}
-	rows, err := q.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE status IN (`+placeholders(len(statuses))+`) ORDER BY scheduled_for, id`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return collectRuns(rows)
+	return queryAll(ctx, q, scanRun, `SELECT `+runCols+` FROM runs WHERE status IN (`+placeholders(len(statuses))+`) ORDER BY scheduled_for, id`, args...)
 }
 
 // PendingRunsForJob returns a job's pending runs in dispatch order.
 func PendingRunsForJob(ctx context.Context, q Querier, jobID string) ([]model.Run, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE job_id = ? AND status = 'pending' ORDER BY scheduled_for, id`, jobID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return collectRuns(rows)
+	return queryAll(ctx, q, scanRun, `SELECT `+runCols+` FROM runs WHERE job_id = ? AND status = 'pending' ORDER BY scheduled_for, id`, jobID)
 }
 
 // ChainLatest returns the newest run of a retry/defer chain.
@@ -284,13 +274,8 @@ func CancelPendingForJob(ctx context.Context, q Querier, jobID string, reason st
 	for _, k := range kinds {
 		args = append(args, k)
 	}
-	rows, err := q.QueryContext(ctx, `UPDATE runs SET status = 'cancelled', error = ?, finished_at = ?
+	return queryAll(ctx, q, scanRun, `UPDATE runs SET status = 'cancelled', error = ?, finished_at = ?
 		WHERE job_id = ? AND status = 'pending' AND trigger IN (`+placeholders(len(kinds))+`) RETURNING `+runCols, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return collectRuns(rows)
 }
 
 // RunFilter narrows ListRuns.
@@ -304,15 +289,10 @@ type RunFilter struct {
 
 // ListRuns pages runs by id descending.
 func ListRuns(ctx context.Context, q Querier, f RunFilter) ([]model.Run, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+runCols+` FROM runs
+	return queryAll(ctx, q, scanRun, `SELECT `+runCols+` FROM runs
 		WHERE (? = '' OR client_id = ?) AND (? = '' OR job_id = ?) AND (? = '' OR status = ?) AND (? = '' OR id < ?)
 		ORDER BY id DESC LIMIT ?`,
 		f.ClientID, f.ClientID, f.JobID, f.JobID, f.Status, f.Status, f.Cursor, f.Cursor, f.Limit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return collectRuns(rows)
 }
 
 // DeleteFinishedBefore deletes at most limit terminal runs finished before
@@ -330,31 +310,12 @@ func DeleteFinishedBefore(ctx context.Context, q Querier, before time.Time, jobI
 		}
 	}
 	args = append(args, limit)
-	rows, err := q.QueryContext(ctx, `DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?`+
+	return queryAll(ctx, q, scanID, `DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?`+
 		jobClause+` AND status NOT IN ('pending','running','waiting') LIMIT ?) RETURNING id`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
 }
 
-func collectRuns(rows *sql.Rows) ([]model.Run, error) {
-	var out []model.Run
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+func scanID(row scanner) (string, error) {
+	var id string
+	err := row.Scan(&id)
+	return id, err
 }

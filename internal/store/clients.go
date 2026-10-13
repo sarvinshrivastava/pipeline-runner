@@ -17,7 +17,7 @@ var ErrHasJobs = errors.New("client owns jobs")
 const clientCols = `id, name, token_hash, prev_token_hash, prev_valid_until, scopes, callback_hosts,
 	secret_ref_prefixes, repo_prefixes, container_allowed, root_allowed, ntfy_topic, created_at, updated_at`
 
-func scanClient(row interface{ Scan(...any) error }) (model.Client, error) {
+func scanClient(row scanner) (model.Client, error) {
 	var (
 		c                              model.Client
 		prevUntil                      sql.NullInt64
@@ -85,20 +85,7 @@ func ClientByTokenHash(ctx context.Context, q Querier, h []byte, now time.Time) 
 
 // ListClients returns every client ordered by name.
 func ListClients(ctx context.Context, q Querier) ([]model.Client, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+clientCols+` FROM clients ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []model.Client
-	for rows.Next() {
-		c, err := scanClient(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return queryAll(ctx, q, scanClient, `SELECT `+clientCols+` FROM clients ORDER BY name`)
 }
 
 // UpdateClient writes the mutable settings of a client.

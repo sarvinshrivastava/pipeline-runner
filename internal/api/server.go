@@ -118,6 +118,10 @@ func principalFrom(r *http.Request) model.Principal {
 	return p
 }
 
+// isBootstrap reports whether p is the bootstrap admin token, which belongs
+// to no client.
+func isBootstrap(p model.Principal) bool { return p.Admin && p.ClientID == "" }
+
 // wrap applies per-route auth, limiting and scope checks.
 func (s *Server) wrap(rt route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

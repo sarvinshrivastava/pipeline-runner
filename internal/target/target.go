@@ -50,9 +50,3 @@ type Result struct {
 type Executor interface {
 	Execute(ctx context.Context, in ExecInput) Result
 }
-
-// ExecutorFunc adapts a function to Executor.
-type ExecutorFunc func(ctx context.Context, in ExecInput) Result
-
-// Execute implements Executor.
-func (f ExecutorFunc) Execute(ctx context.Context, in ExecInput) Result { return f(ctx, in) }

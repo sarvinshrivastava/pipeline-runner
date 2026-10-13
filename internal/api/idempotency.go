@@ -59,7 +59,7 @@ func (s *Server) beginIdem(w http.ResponseWriter, r *http.Request, route string,
 	}
 	p := principalFrom(r)
 	clientID := p.ClientID
-	if p.Admin && clientID == "" {
+	if isBootstrap(p) {
 		clientID = "_admin"
 	}
 	row, err := store.IdemBegin(r.Context(), s.d.Store.W, clientID, route, key, hash, s.d.Now())

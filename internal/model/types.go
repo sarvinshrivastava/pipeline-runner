@@ -3,6 +3,7 @@ package model
 
 import (
 	"encoding/json"
+	"slices"
 	"time"
 )
 
@@ -281,28 +282,15 @@ type Principal struct {
 
 // PrincipalOf converts a client row into the principal its jobs act as.
 func PrincipalOf(c Client) Principal {
-	p := Principal{
+	return Principal{
 		ClientID: c.ID, Name: c.Name, Scopes: c.Scopes,
 		CallbackHosts: c.CallbackHosts, SecretRefPrefixes: c.SecretRefPrefixes, RepoPrefixes: c.RepoPrefixes,
 		ContainerAllowed: c.ContainerAllowed, RootAllowed: c.RootAllowed, NtfyTopic: c.NtfyTopic,
+		Admin: slices.Contains(c.Scopes, ScopeAdmin),
 	}
-	for _, s := range c.Scopes {
-		if s == ScopeAdmin {
-			p.Admin = true
-		}
-	}
-	return p
 }
 
 // HasScope reports whether the principal may use scope. Admin implies all.
 func (p Principal) HasScope(scope string) bool {
-	if p.Admin {
-		return true
-	}
-	for _, s := range p.Scopes {
-		if s == scope {
-			return true
-		}
-	}
-	return false
+	return p.Admin || slices.Contains(p.Scopes, scope)
 }

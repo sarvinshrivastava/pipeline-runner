@@ -13,7 +13,7 @@ import (
 const jobCols = `id, client_id, name, state, trigger_json, target_type, target_json, policy_json,
 	concurrency_key, rev, last_nominal_for, consecutive_skips, created_at, updated_at`
 
-func scanJob(row interface{ Scan(...any) error }) (model.Job, error) {
+func scanJob(row scanner) (model.Job, error) {
 	var (
 		j                           model.Job
 		trig, ttype, target, policy string
@@ -82,35 +82,13 @@ func GetJob(ctx context.Context, q Querier, id string) (model.Job, error) {
 
 // ListJobs pages jobs by id descending. clientID "" lists all clients.
 func ListJobs(ctx context.Context, q Querier, clientID, cursor string, limit int) ([]model.Job, error) {
-	query := `SELECT ` + jobCols + ` FROM jobs WHERE (? = '' OR client_id = ?) AND (? = '' OR id < ?) ORDER BY id DESC LIMIT ?`
-	rows, err := q.QueryContext(ctx, query, clientID, clientID, cursor, cursor, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return collectJobs(rows)
+	return queryAll(ctx, q, scanJob, `SELECT `+jobCols+` FROM jobs WHERE (? = '' OR client_id = ?) AND (? = '' OR id < ?) ORDER BY id DESC LIMIT ?`,
+		clientID, clientID, cursor, cursor, limit)
 }
 
 // AllJobs returns every job (the engine's cache).
 func AllJobs(ctx context.Context, q Querier) ([]model.Job, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+jobCols+` FROM jobs`)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return collectJobs(rows)
-}
-
-func collectJobs(rows *sql.Rows) ([]model.Job, error) {
-	var out []model.Job
-	for rows.Next() {
-		j, err := scanJob(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, j)
-	}
-	return out, rows.Err()
+	return queryAll(ctx, q, scanJob, `SELECT `+jobCols+` FROM jobs`)
 }
 
 // CountJobs counts a client's jobs.

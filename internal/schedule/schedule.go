@@ -104,9 +104,6 @@ func classify(expr string) (wallClock, seconds bool) {
 // HasSeconds reports whether the expression can fire more than once a minute.
 func (s Schedule) HasSeconds() bool { return s.seconds }
 
-// Location returns the bound location.
-func (s Schedule) Location() *time.Location { return s.loc }
-
 // Next returns the first fire instant strictly after `after`, in UTC, or the
 // zero time when there is none within the scan bound.
 func (s Schedule) Next(after time.Time) time.Time {

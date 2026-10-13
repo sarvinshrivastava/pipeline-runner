@@ -144,6 +144,27 @@ func migrate(ctx context.Context, db *sql.DB) error {
 
 // ---------------------------------------------------------------- helpers
 
+// scanner is satisfied by *sql.Row and *sql.Rows.
+type scanner interface{ Scan(dest ...any) error }
+
+// queryAll runs query and scans every row with scan.
+func queryAll[T any](ctx context.Context, q Querier, scan func(scanner) (T, error), query string, args ...any) ([]T, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []T
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 func ms(t time.Time) int64 { return t.UnixMilli() }
 
 func msPtr(t *time.Time) any {
