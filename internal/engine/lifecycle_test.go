@@ -608,3 +608,29 @@ func TestHealthStall(t *testing.T) {
 	close(release)
 	h.waitFor("healthy again", h.e.Healthy)
 }
+
+// A deleted or disabled job's future runs stay in the heap as ghosts until
+// due; they must leave the pending count at once (load-test finding).
+func TestRemovedJobRunsLeavePendingCount(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	del := h.create(cronJob("del", "0 0 1 1 *", nil))
+	dis := h.create(cronJob("dis", "0 0 1 1 *", nil))
+	pending := func() (n int) {
+		h.onLoop(func() { n = len(h.e.inHeap) + len(h.e.parked) })
+		return
+	}
+	if n := pending(); n != 2 {
+		t.Fatalf("pending = %d, want 2", n)
+	}
+	if err := h.e.DeleteJob(ctx, del.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.e.SetEnabled(ctx, dis.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+	if n := pending(); n != 0 {
+		t.Fatalf("pending = %d after delete and disable, want 0", n)
+	}
+}

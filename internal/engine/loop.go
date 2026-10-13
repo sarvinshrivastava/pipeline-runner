@@ -26,6 +26,7 @@ type evJobChanged struct {
 	deleted  bool
 	inserted []model.Run
 	released []string // waiting runs cancelled in the write's transaction
+	dropped  []string // pending runs cancelled in the write's transaction
 	cancel   []string // running runs to cancel
 }
 type evExecDone struct {

@@ -225,6 +225,7 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 	now := e.now()
 	var j model.Job
 	var inserted []model.Run
+	var dropped []string
 	err := e.st.Tx(ctx, func(tx *sql.Tx) error {
 		var err error
 		j, err = store.GetJob(ctx, tx, jobID)
@@ -270,6 +271,7 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 			return err
 		}
 		for _, r := range cancelled {
+			dropped = append(dropped, r.ID)
 			if r.Kind == model.KindSchedule && r.NominalFor != nil {
 				c := r.NominalFor.Add(-time.Millisecond)
 				j.LastNominalFor = &c
@@ -284,7 +286,7 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 	if err != nil {
 		return j, err
 	}
-	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted})
+	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted, dropped: dropped})
 	return j, nil
 }
 
@@ -292,16 +294,20 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 // transaction; running runs are cancelled through the loop.
 func (e *Engine) DeleteJob(ctx context.Context, jobID string) error {
 	now := e.now()
-	var released, running []string
+	var released, running, dropped []string
 	err := e.st.Tx(ctx, func(tx *sql.Tx) error {
 		if _, err := store.GetJob(ctx, tx, jobID); errors.Is(err, store.ErrNotFound) {
 			return ErrNotFound
 		} else if err != nil {
 			return err
 		}
-		if _, err := store.CancelPendingForJob(ctx, tx, jobID, "job deleted", now,
-			model.KindSchedule, model.KindRetry, model.KindDefer, model.KindInvoke); err != nil {
+		cancelled, err := store.CancelPendingForJob(ctx, tx, jobID, "job deleted", now,
+			model.KindSchedule, model.KindRetry, model.KindDefer, model.KindInvoke)
+		if err != nil {
 			return err
+		}
+		for _, r := range cancelled {
+			dropped = append(dropped, r.ID)
 		}
 		live, err := runsOfJob(ctx, tx, jobID, model.StatusWaiting, model.StatusRunning)
 		if err != nil {
@@ -326,7 +332,7 @@ func (e *Engine) DeleteJob(ctx context.Context, jobID string) error {
 	if err != nil {
 		return err
 	}
-	e.notifyJob(ctx, evJobChanged{jobID: jobID, deleted: true, released: released, cancel: running})
+	e.notifyJob(ctx, evJobChanged{jobID: jobID, deleted: true, released: released, cancel: running, dropped: dropped})
 	return nil
 }
 

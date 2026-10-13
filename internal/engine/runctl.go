@@ -306,12 +306,14 @@ func (e *Engine) heartbeat(runID string) (model.Run, *time.Time, error) {
 }
 
 func (e *Engine) onJobChanged(v evJobChanged) {
-	if v.deleted {
+	switch j, err := store.GetJob(e.life, e.st.W, v.jobID); {
+	case v.deleted || errors.Is(err, store.ErrNotFound):
+		// A create event can arrive after the job was already deleted.
 		delete(e.jobs, v.jobID)
-	} else if j, err := store.GetJob(e.life, e.st.W, v.jobID); err == nil {
-		e.jobs[j.ID] = newJobEntry(j, e.now())
-	} else {
+	case err != nil:
 		e.log.Error("reload job", "job", v.jobID, "err", err)
+	default:
+		e.jobs[j.ID] = newJobEntry(j, e.now())
 	}
 	for _, id := range v.released {
 		e.release(id)
@@ -325,6 +327,12 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 		if cancel, ok := e.cancelFns[id]; ok {
 			cancel()
 		}
+	}
+	// Their heap entries become ghosts that dispatch skips; stop counting them
+	// as pending now rather than when they come due.
+	for _, id := range v.dropped {
+		delete(e.inHeap, id)
+		e.unpark(id)
 	}
 	for _, r := range v.inserted {
 		e.push(r.ID, r.ScheduledFor)
