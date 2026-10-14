@@ -74,14 +74,20 @@ func (e *Engine) onExecDone(runID string, res target.Result) {
 		return // past drainBy: boot recovery owns this run
 	}
 	delete(e.cancelFns, runID)
-	r, err := store.GetRun(e.life, e.st.W, runID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		e.log.Error("load run on exec done; retrying", "run", runID, "err", err)
-		e.redeliver(runID, res)
-		return
-	}
-	if err != nil || r.Status != model.StatusRunning {
-		return
+	// The claimed row is authoritative while running. Boot redispatch,
+	// reattach or a spec failure in rebuildHeld leave none: read it.
+	r := e.held[runID].run
+	if r.ID == "" || r.Status != model.StatusRunning {
+		var err error
+		r, err = store.GetRun(e.life, e.st.W, runID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			e.log.Error("load run on exec done; retrying", "run", runID, "err", err)
+			e.redeliver(runID, res)
+			return
+		}
+		if err != nil || r.Status != model.StatusRunning {
+			return
+		}
 	}
 	spec, err := e.spec(r)
 	if errors.Is(err, store.ErrNotFound) {
@@ -126,6 +132,10 @@ func (e *Engine) onExecDone(runID string, res target.Result) {
 		}
 		if !ok {
 			return
+		}
+		if h, ok := e.held[r.ID]; ok {
+			h.run = model.Run{} // waiting rows can change in API transactions
+			e.held[r.ID] = h
 		}
 		e.releasePool(r.ID)
 		e.armLease(r.ID, lease)
@@ -236,6 +246,7 @@ func (e *Engine) cancelRun(runID string) (model.Run, bool, error) {
 	case model.StatusPending:
 		e.unpark(r.ID)
 		delete(e.inHeap, r.ID) // its heap entry is a ghost from now on
+		delete(e.rows, r.ID)
 		e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusCancelled, err: "cancelled"})
 	case model.StatusWaiting:
 		e.finalize(r, []model.Status{model.StatusWaiting}, outcome{status: model.StatusCancelled, err: "cancelled"})
@@ -279,6 +290,10 @@ func (e *Engine) completeRun(runID string, cr model.CompleteReq) (model.Run, boo
 			return r, false, err
 		}
 		if ok {
+			if h, held := e.held[r.ID]; held && h.run.ID != "" {
+				h.run.EarlyResult = &cr
+				e.held[r.ID] = h
+			}
 			return r, true, nil
 		}
 		if r.EarlyResult != nil && sameComplete(*r.EarlyResult, cr) {
@@ -374,6 +389,7 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 	// as pending now rather than when they come due.
 	for _, id := range v.dropped {
 		delete(e.inHeap, id)
+		delete(e.rows, id)
 		e.unpark(id)
 		if r, err := store.GetRun(e.life, e.st.W, id); err == nil && r.Status.Terminal() {
 			e.notifyAwaiters(r) // ?wait callers on a cancelled chain
@@ -383,7 +399,7 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 		return // runs it inserted were cancelled with it
 	}
 	for _, r := range v.inserted {
-		e.push(r.ID, r.ScheduledFor)
+		e.pushRun(r)
 	}
 }
 

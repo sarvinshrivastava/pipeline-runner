@@ -233,6 +233,9 @@ func (h *harness) waitStatus(id string, want model.Status) model.Run {
 		r = h.run(id)
 		return r.Status == want
 	})
+	// The status commits before the handler's post-commit work (pages,
+	// pushes); let the loop finish that handler too.
+	h.sync()
 	return r
 }
 

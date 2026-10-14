@@ -96,7 +96,18 @@ type held struct {
 	jobID string
 	ns    string
 	pool  string
+	// run is the row as claimed, authoritative only while run.Status is
+	// running (the loop is the only writer of running rows). It is zero for
+	// waiting runs and for entries rebuilt without a row.
+	run model.Run
 }
+
+// Row cache bounds (see Engine.rows).
+const (
+	rowHorizon    = 5 * time.Second // only rows due this soon are cached at push
+	rowMaxPayload = 8 << 10         // payload (and ad hoc spec) size limit
+	rowCap        = 2048            // entries; ~32 MiB worst case
+)
 
 type jobEntry struct {
 	job    model.Job
@@ -127,8 +138,16 @@ type Engine struct {
 	done     chan struct{}
 
 	// Loop-owned state.
-	heap            fireHeap
-	inHeap          map[string]int
+	heap   fireHeap
+	inHeap map[string]int
+	// rows caches pending runs' rows so dispatch and wake read nothing.
+	// Set only by pushRun (when due within rowHorizon) and park (any due
+	// time); both skip payloads or ad hoc specs over rowMaxPayload and stop
+	// at rowCap. pushAt and pop/unpark never touch it. Deleted at dispatch
+	// exit (except park and transient re-push), on onJobChanged dropped, on
+	// cancelRun of a pending run, and by reconcile for runs no longer
+	// pending. A stale row only loses its guarded claim.
+	rows            map[string]model.Run
 	parked          map[string]string   // runID → wait list name
 	waits           map[string][]string // wait list name → FIFO of run ids
 	held            map[string]held
@@ -170,7 +189,7 @@ func New(d Deps) *Engine {
 	e := &Engine{
 		d: d, st: d.Store, log: d.Log,
 		events: make(chan event, 1024), life: life, stopLife: stop, done: make(chan struct{}), stopping: make(chan struct{}),
-		inHeap: map[string]int{}, parked: map[string]string{}, waits: map[string][]string{},
+		inHeap: map[string]int{}, rows: map[string]model.Run{}, parked: map[string]string{}, waits: map[string][]string{},
 		held: map[string]held{}, jobBusy: map[string]int{}, keyBusy: map[string]int{}, inflight: map[string]int{},
 		jobs: map[string]*jobEntry{}, revs: map[revKey]model.RunSpec{}, awaiters: map[string][]chan model.Run{},
 		leaseGen: map[string]uint64{}, leaseTimers: map[string]Timer{}, cancelFns: map[string]context.CancelFunc{},

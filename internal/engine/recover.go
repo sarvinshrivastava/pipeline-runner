@@ -130,7 +130,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		return err
 	}
 	for _, r := range pending {
-		e.push(r.ID, r.ScheduledFor)
+		e.pushRun(r)
 	}
 	e.ensureAllMaterialised(pending)
 
@@ -172,7 +172,8 @@ func (e *Engine) startReattach(r model.Run, spec model.RunSpec) {
 }
 
 // rebuildHeld recomputes held slots and counts from running/waiting rows.
-// Entries of runs whose result is unflushed are kept as they are.
+// Running entries keep the fresh row; waiting entries carry none. Entries of
+// runs whose result is unflushed are kept as they are.
 func (e *Engine) rebuildHeld(ctx context.Context) error {
 	rows, err := store.RunsByStatus(ctx, e.st.W, model.StatusRunning, model.StatusWaiting)
 	if err != nil {
@@ -195,6 +196,7 @@ func (e *Engine) rebuildHeld(ctx context.Context) error {
 		h := held{jobID: r.JobID, ns: nsKeyOf(r, spec)}
 		if r.Status == model.StatusRunning {
 			h.pool = poolOf(spec.Target.Type)
+			h.run = r
 		}
 		next[r.ID] = h
 	}
@@ -278,7 +280,7 @@ func (e *Engine) reconcile(now time.Time) {
 		isPending[r.ID] = true
 		if e.inHeap[r.ID] == 0 && e.parked[r.ID] == "" {
 			e.log.Warn("reconcile: pending run missing from heap; re-pushed", "run", r.ID)
-			e.push(r.ID, r.ScheduledFor)
+			e.pushRun(r)
 		}
 	}
 	// Ghosts (runs no longer pending) leave the pending count; their heap
@@ -291,6 +293,11 @@ func (e *Engine) reconcile(now time.Time) {
 	for id := range e.parked {
 		if !isPending[id] {
 			e.unpark(id)
+		}
+	}
+	for id := range e.rows {
+		if !isPending[id] {
+			delete(e.rows, id)
 		}
 	}
 	e.ensureAllMaterialised(pending)

@@ -228,7 +228,7 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		}
 	}
 	if o.successor != nil {
-		e.push(o.successor.ID, o.successor.ScheduledFor)
+		e.pushRun(*o.successor)
 	} else {
 		e.notifyAwaiters(r)
 	}
@@ -331,7 +331,7 @@ func (e *Engine) materialise(je *jobEntry) {
 		e.missedBatch[je.job.ID] += collapsed // occurrences that fell inside an outage
 	}
 	if inserted != nil {
-		e.push(inserted.ID, inserted.ScheduledFor)
+		e.pushRun(*inserted)
 	}
 }
 

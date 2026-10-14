@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -158,7 +159,7 @@ func (e *Engine) handle(ev event) {
 	switch v := ev.(type) {
 	case evRunInserted:
 		for _, r := range v.runs {
-			e.push(r.ID, r.ScheduledFor)
+			e.pushRun(r)
 		}
 	case evJobChanged:
 		e.onJobChanged(v)
@@ -210,9 +211,52 @@ func reply[T any](ch chan T, v T) {
 	}
 }
 
-func (e *Engine) push(runID string, at time.Time) {
+// pushAt queues a run by ID only; any cached row is kept.
+func (e *Engine) pushAt(runID string, at time.Time) {
 	e.heap.push(entry{runID: runID, at: at, kind: entryDue})
 	e.inHeap[runID]++
+}
+
+// pushRun queues a run and caches its row when it is due within rowHorizon.
+func (e *Engine) pushRun(r model.Run) {
+	if r.ScheduledFor.Sub(e.now()) <= rowHorizon {
+		e.cacheRow(r)
+	}
+	e.pushAt(r.ID, r.ScheduledFor)
+}
+
+// cacheRow stores a pending run's row within the payload and count bounds.
+// The times are cut to milliseconds, as the store would return them.
+func (e *Engine) cacheRow(r model.Run) {
+	if r.Status != model.StatusPending || len(r.Payload) > rowMaxPayload {
+		return
+	}
+	if _, ok := e.rows[r.ID]; !ok && len(e.rows) >= rowCap {
+		return
+	}
+	if r.AdhocSpec != nil {
+		if b, err := json.Marshal(r.AdhocSpec); err != nil || len(b) > rowMaxPayload {
+			return
+		}
+	}
+	r.ScheduledFor, r.OriginFor, r.ContextFor = msUTC(r.ScheduledFor), msUTC(r.OriginFor), msUTC(r.ContextFor)
+	r.LatenessRef, r.CreatedAt = msUTC(r.LatenessRef), msUTC(r.CreatedAt)
+	if r.NominalFor != nil {
+		n := msUTC(*r.NominalFor)
+		r.NominalFor = &n
+	}
+	e.rows[r.ID] = r
+}
+
+func msUTC(t time.Time) time.Time { return time.UnixMilli(t.UnixMilli()).UTC() }
+
+// pendingRow returns a pending run's row from the cache, else from the
+// reader pool.
+func (e *Engine) pendingRow(ctx context.Context, runID string) (model.Run, error) {
+	if r, ok := e.rows[runID]; ok {
+		return r, nil
+	}
+	return store.GetRun(ctx, e.st.R, runID)
 }
 
 func (e *Engine) fireDue(now time.Time) {
@@ -290,18 +334,29 @@ func (e *Engine) keyLimit(ns string, own int) int {
 
 func (e *Engine) dispatch(runID string, now time.Time) {
 	ctx := e.life
-	r, err := store.GetRun(ctx, e.st.W, runID)
+	// The cached row leaves on every exit except a park or a transient re-push.
+	keepRow := false
+	defer func() {
+		if !keepRow {
+			delete(e.rows, runID)
+		}
+	}()
+	retry := func() {
+		keepRow = true
+		e.pushAt(runID, now.Add(time.Second))
+	}
+	r, err := e.pendingRow(ctx, runID)
 	if err != nil || r.Status != model.StatusPending {
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			e.log.Error("load run for dispatch", "run", runID, "err", err)
-			e.push(runID, now.Add(time.Second))
+			retry()
 		}
 		return // ghost: deleted or no longer pending
 	}
 	spec, err := e.spec(r)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		e.log.Error("load run spec; retrying", "run", runID, "err", err)
-		e.push(runID, now.Add(time.Second))
+		retry()
 		return
 	}
 	if err != nil {
@@ -320,7 +375,7 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 				je = newJobEntry(j, now)
 				e.jobs[j.ID] = je
 			case !errors.Is(err, store.ErrNotFound):
-				e.push(runID, now.Add(time.Second))
+				retry()
 				return
 			}
 		}
@@ -333,9 +388,9 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 	late := now.Sub(r.LatenessRef)
 	if late > time.Duration(spec.Policy.MaxLateSec)*time.Second {
 		lateMs := late.Milliseconds()
-		e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusMissed, lateMs: &lateMs,
+		won := e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusMissed, lateMs: &lateMs,
 			err: fmt.Sprintf("not dispatched within max_late_sec (%ds)", spec.Policy.MaxLateSec)})
-		if r.JobID != "" {
+		if won && r.JobID != "" { // a stale row's lost finalize missed nothing
 			e.missedBatch[r.JobID]++
 		}
 		return
@@ -347,6 +402,7 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 		return
 	}
 	if list != "" {
+		keepRow = true
 		e.park(r, spec, list)
 		return
 	}
@@ -359,15 +415,15 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 	})
 	if err != nil {
 		e.log.Error("claim run", "run", r.ID, "err", err)
-		e.push(r.ID, now.Add(time.Second))
+		retry()
 		return
 	}
 	if !ok {
-		return
+		return // stale row: the run left pending behind the loop's back
 	}
 	r.Status, r.StartedAt, r.LateMs, r.DeadlineAt = model.StatusRunning, &now, &lateMs, &deadline
 
-	h := held{jobID: r.JobID, ns: nsKeyOf(r, spec), pool: poolOf(spec.Target.Type)}
+	h := held{jobID: r.JobID, ns: nsKeyOf(r, spec), pool: poolOf(spec.Target.Type), run: r}
 	e.reserve(r.ID, h)
 
 	jobLabel := r.JobName
@@ -457,6 +513,7 @@ func (e *Engine) park(r model.Run, spec model.RunSpec, list string) {
 	}
 	e.parked[r.ID] = list
 	e.waits[list] = append(e.waits[list], r.ID)
+	e.cacheRow(r) // a parked run is due: its admission reads nothing
 	e.heap.push(entry{runID: r.ID, at: r.LatenessRef.Add(time.Duration(spec.Policy.MaxLateSec)*time.Second + time.Millisecond), kind: entryLateDeadline})
 }
 
@@ -492,7 +549,7 @@ func (e *Engine) wake(list string) {
 			return
 		}
 		head := ids[0]
-		r, err := store.GetRun(e.life, e.st.W, head)
+		r, err := e.pendingRow(e.life, head)
 		if err != nil || r.Status != model.StatusPending {
 			e.unpark(head)
 			continue
