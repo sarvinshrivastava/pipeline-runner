@@ -18,6 +18,10 @@ import (
 
 const maxErrorBytes = 4 << 10
 
+// maxExpiredCount caps the expired-occurrence count (and the Next calls it
+// takes) per materialise; a page then says "at least".
+const maxExpiredCount = 1_000
+
 // outcome is a decided terminal transition.
 type outcome struct {
 	status          model.Status
@@ -322,37 +326,51 @@ func (e *Engine) isUnflushed(runID string) bool {
 
 // materialise inserts the job's next schedule run on the loop.
 func (e *Engine) materialise(je *jobEntry) {
-	inserted, collapsed, err := insertNext(e.life, e.st.W, &je.job, e.now(), e.d.Rand)
+	inserted, collapsed, expired, err := insertNext(e.life, e.st.W, &je.job, e.now(), e.d.Rand)
 	if err != nil {
 		e.log.Error("materialise", "job", je.job.ID, "err", err)
 		return
 	}
-	if collapsed > 0 {
-		e.missedBatch[je.job.ID] += collapsed // occurrences that fell inside an outage
-	}
+	e.countCoalesced(je.job, collapsed, expired)
+	e.addPageCounts(je.job.ID, collapsed, expired)
 	if inserted != nil {
 		e.pushRun(*inserted)
+	}
+}
+
+// countCoalesced adds a materialise's dropped occurrences to the metric. It
+// is safe off the loop (API transactions call it after commit).
+func (e *Engine) countCoalesced(j model.Job, collapsed, expired int) {
+	if m := e.d.Metrics; m != nil {
+		m.AddCoalesced(j.Name, j.ClientID, "backlog", collapsed)
+		m.AddCoalesced(j.Name, j.ClientID, "expired", expired)
 	}
 }
 
 // nextNominal applies the cursor rule. Cron: Next(max(cursor, now − max_late)),
 // with a NULL cursor meaning "from now" (a new job never fires the past).
 // When several occurrences are already due, they collapse into the latest
-// one; collapsed is how many earlier ones were dropped. At: the instant if it
-// is after max(cursor, now − max_late). Zero means none.
-func nextNominal(j model.Job, now time.Time) (nominal time.Time, collapsed int) {
+// one; collapsed is how many earlier ones were dropped. expired counts the
+// occurrences after the cursor that are older than max_late (up to
+// maxExpiredCount). At: the instant if it is after max(cursor, now −
+// max_late). Zero means none.
+func nextNominal(j model.Job, now time.Time) (nominal time.Time, collapsed, expired int) {
 	window := now.Add(-time.Duration(j.Policy.MaxLateSec) * time.Second)
 	switch j.Trigger.Type {
 	case model.TriggerCron:
 		s, err := schedule.Parse(j.Trigger.Cron, j.Trigger.Timezone)
 		if err != nil {
-			return time.Time{}, 0
+			return time.Time{}, 0, 0
 		}
 		base := now
 		if j.LastNominalFor != nil {
 			base = window
 			if j.LastNominalFor.After(window) {
 				base = *j.LastNominalFor
+			} else {
+				for t := s.Next(*j.LastNominalFor); !t.IsZero() && !t.After(window) && expired < maxExpiredCount; t = s.Next(t) {
+					expired++
+				}
 			}
 		}
 		nominal = s.Next(base)
@@ -364,33 +382,34 @@ func nextNominal(j model.Job, now time.Time) (nominal time.Time, collapsed int) 
 			nominal = next
 			collapsed++
 		}
-		return nominal, collapsed
+		return nominal, collapsed, expired
 	case model.TriggerAt:
 		base := window
 		if j.LastNominalFor != nil && j.LastNominalFor.After(base) {
 			base = *j.LastNominalFor
 		}
 		if j.Trigger.At != nil && j.Trigger.At.After(base) {
-			return *j.Trigger.At, 0
+			return *j.Trigger.At, 0, 0
 		}
 	}
-	return time.Time{}, 0
+	return time.Time{}, 0, 0
 }
 
 // insertNext materialises j's next schedule run through q (the loop's writer
 // or an API transaction). It updates j's cursor (and state, for a one-shot
-// with nothing left) in place. A runs_one_pending conflict inserts nothing.
-func insertNext(ctx context.Context, q store.Querier, j *model.Job, now time.Time, rnd func(int64) int64) (*model.Run, int, error) {
+// with nothing left) in place. A runs_one_pending conflict inserts nothing
+// and reports no counts. It returns nextNominal's collapsed and expired.
+func insertNext(ctx context.Context, q store.Querier, j *model.Job, now time.Time, rnd func(int64) int64) (*model.Run, int, int, error) {
 	if j.State != model.JobActive || (j.Trigger.Type != model.TriggerCron && j.Trigger.Type != model.TriggerAt) {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
-	nominal, collapsed := nextNominal(*j, now)
+	nominal, collapsed, expired := nextNominal(*j, now)
 	if nominal.IsZero() {
 		if j.Trigger.Type == model.TriggerAt {
 			j.State = model.JobDone
-			return nil, 0, store.SetJobState(ctx, q, j.ID, model.JobDone, now)
+			return nil, 0, 0, store.SetJobState(ctx, q, j.ID, model.JobDone, now)
 		}
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 	fire := nominal
 	if j.Policy.JitterSec > 0 {
@@ -404,13 +423,13 @@ func insertNext(ctx context.Context, q store.Querier, j *model.Job, now time.Tim
 	}
 	ok, err := store.InsertScheduleRun(ctx, q, r)
 	if err != nil || !ok {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	if err := store.SetJobCursor(ctx, q, j.ID, &nominal); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	j.LastNominalFor = &nominal
-	return &r, collapsed, nil
+	return &r, collapsed, expired, nil
 }
 
 // ---------------------------------------------------------------- paging

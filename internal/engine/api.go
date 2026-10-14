@@ -110,6 +110,7 @@ func (e *Engine) CreateJob(ctx context.Context, owner model.Principal, in model.
 	now := e.now()
 	j.ID, j.Rev, j.CreatedAt, j.UpdatedAt = newID(), 1, now, now
 	var inserted []model.Run
+	var collapsed, expired int
 	err = e.st.Tx(ctx, func(tx *store.Tx) error {
 		n, err := store.CountJobs(ctx, tx, owner.ClientID)
 		if err != nil {
@@ -124,10 +125,11 @@ func (e *Engine) CreateJob(ctx context.Context, owner model.Principal, in model.
 			}
 			return err
 		}
-		r, _, err := insertNext(ctx, tx, &j, now, e.d.Rand)
+		r, coal, exp, err := insertNext(ctx, tx, &j, now, e.d.Rand)
 		if err != nil {
 			return err
 		}
+		collapsed, expired = coal, exp
 		if r != nil {
 			inserted = append(inserted, *r)
 		}
@@ -139,7 +141,8 @@ func (e *Engine) CreateJob(ctx context.Context, owner model.Principal, in model.
 	if err != nil {
 		return j, err
 	}
-	e.notifyJob(ctx, evJobChanged{jobID: j.ID, inserted: inserted})
+	e.countCoalesced(j, collapsed, expired)
+	e.notifyJob(ctx, evJobChanged{jobID: j.ID, inserted: inserted, coalesced: collapsed, expired: expired})
 	return j, nil
 }
 
@@ -176,6 +179,7 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 	var next model.Job
 	var inserted []model.Run
 	var dropped []string
+	var collapsed, expired int
 	err = e.st.Tx(ctx, func(tx *store.Tx) error {
 		cur, err := store.GetJob(ctx, tx, jobID) // re-read inside the transaction
 		if err != nil {
@@ -225,10 +229,11 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 			}
 			return err
 		}
-		r, _, err := insertNext(ctx, tx, &next, now, e.d.Rand)
+		r, coal, exp, err := insertNext(ctx, tx, &next, now, e.d.Rand)
 		if err != nil {
 			return err
 		}
+		collapsed, expired = coal, exp
 		if r != nil {
 			inserted = append(inserted, *r)
 		}
@@ -237,7 +242,8 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 	if err != nil {
 		return next, err
 	}
-	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted, dropped: dropped})
+	e.countCoalesced(next, collapsed, expired)
+	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted, dropped: dropped, coalesced: collapsed, expired: expired})
 	return next, nil
 }
 
@@ -253,6 +259,7 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 	var j model.Job
 	var inserted []model.Run
 	var dropped []string
+	var collapsed, expired int
 	err := e.st.Tx(ctx, func(tx *store.Tx) error {
 		var err error
 		j, err = store.GetJob(ctx, tx, jobID)
@@ -281,10 +288,11 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 			if err := store.SetJobState(ctx, tx, j.ID, model.JobActive, now); err != nil {
 				return err
 			}
-			r, _, err := insertNext(ctx, tx, &j, now, e.d.Rand)
+			r, coal, exp, err := insertNext(ctx, tx, &j, now, e.d.Rand)
 			if err != nil {
 				return err
 			}
+			collapsed, expired = coal, exp
 			if r != nil {
 				inserted = append(inserted, *r)
 			}
@@ -313,7 +321,8 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 	if err != nil {
 		return j, err
 	}
-	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted, dropped: dropped})
+	e.countCoalesced(j, collapsed, expired)
+	e.notifyJob(ctx, evJobChanged{jobID: jobID, inserted: inserted, dropped: dropped, coalesced: collapsed, expired: expired})
 	return j, nil
 }
 

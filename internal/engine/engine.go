@@ -114,6 +114,13 @@ type jobEntry struct {
 	minGap time.Duration
 }
 
+// pageCount accumulates a job's missed and coalesced occurrences between
+// pages (one page per job per missPageEvery).
+type pageCount struct {
+	missed, coalesced, expired int
+	capped                     bool // expired hit maxExpiredCount: "at least"
+}
+
 type unflushed struct {
 	op      func(ctx context.Context) error
 	after   func() // the post-commit work finalize would have done
@@ -163,7 +170,8 @@ type Engine struct {
 	cancelFns       map[string]context.CancelFunc
 	cancelRequested map[string]bool
 	unflushed       []*unflushed
-	missedBatch     map[string]int
+	pageBatch       map[string]*pageCount
+	lastMissPage    map[string]time.Time
 	draining        bool
 	drainBy         time.Time
 	drainDone       chan struct{}
@@ -193,7 +201,7 @@ func New(d Deps) *Engine {
 		held: map[string]held{}, jobBusy: map[string]int{}, keyBusy: map[string]int{}, inflight: map[string]int{},
 		jobs: map[string]*jobEntry{}, revs: map[revKey]model.RunSpec{}, awaiters: map[string][]chan model.Run{},
 		leaseGen: map[string]uint64{}, leaseTimers: map[string]Timer{}, cancelFns: map[string]context.CancelFunc{},
-		cancelRequested: map[string]bool{}, missedBatch: map[string]int{},
+		cancelRequested: map[string]bool{}, pageBatch: map[string]*pageCount{}, lastMissPage: map[string]time.Time{},
 	}
 	e.accepting.Store(true)
 	return e

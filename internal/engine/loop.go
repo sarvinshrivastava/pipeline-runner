@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
@@ -17,18 +18,21 @@ const (
 	maxEventsPerIteration = 256
 	maxFiresPerIteration  = 512
 	reconcileEvery        = 60 * time.Second
+	missPageEvery         = 10 * time.Minute // per job
 )
 
 type event interface{ isEvent() }
 
 type evRunInserted struct{ runs []model.Run }
 type evJobChanged struct {
-	jobID    string
-	deleted  bool
-	inserted []model.Run
-	released []string // waiting runs cancelled in the write's transaction
-	dropped  []string // pending runs cancelled in the write's transaction
-	cancel   []string // running runs to cancel
+	jobID     string
+	deleted   bool
+	inserted  []model.Run
+	coalesced int      // occurrences the write's materialise collapsed (backlog)
+	expired   int      // occurrences older than max_late it skipped
+	released  []string // waiting runs cancelled in the write's transaction
+	dropped   []string // pending runs cancelled in the write's transaction
+	cancel    []string // running runs to cancel
 }
 type evExecDone struct {
 	runID string
@@ -152,6 +156,7 @@ func (e *Engine) loop() {
 			e.reconcile(now)
 		}
 		e.updateGauges()
+		e.flushMissedPages(now)
 	}
 }
 
@@ -195,7 +200,9 @@ func (e *Engine) handle(ev event) {
 	case evShutdown:
 		e.draining, e.drainBy, e.drainDone = true, v.drainBy, v.done
 	case evSync:
-		e.fireDue(e.now())
+		now := e.now()
+		e.fireDue(now)
+		e.flushMissedPages(now)
 		close(v.done)
 	case evCall:
 		v.f()
@@ -281,7 +288,6 @@ func (e *Engine) fireDue(now time.Time) {
 		}
 		e.dispatch(ent.runID, now)
 	}
-	e.flushMissedPages()
 }
 
 // spec returns the snapshot a run executes with.
@@ -391,7 +397,7 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 		won := e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusMissed, lateMs: &lateMs,
 			err: fmt.Sprintf("not dispatched within max_late_sec (%ds)", spec.Policy.MaxLateSec)})
 		if won && r.JobID != "" { // a stale row's lost finalize missed nothing
-			e.missedBatch[r.JobID]++
+			e.pageCountFor(r.JobID).missed++
 		}
 		return
 	}
@@ -573,19 +579,77 @@ func (e *Engine) wake(list string) {
 	}
 }
 
-func (e *Engine) flushMissedPages() {
-	for jobID, n := range e.missedBatch {
-		delete(e.missedBatch, jobID)
+// flushMissedPages pages each job's accumulated counts, at most once per job
+// per missPageEvery; in between they keep accumulating. It runs at the end
+// of every loop pass, so held counts go out once the window lapses.
+func (e *Engine) flushMissedPages(now time.Time) {
+	for jobID, pc := range e.pageBatch {
 		je := e.jobs[jobID]
 		if je == nil {
+			delete(e.pageBatch, jobID)
+			delete(e.lastMissPage, jobID)
 			continue
 		}
-		body := "1 run missed its max_late window and was not run."
-		if n > 1 {
-			body = fmt.Sprintf("%d runs missed their max_late window and were not run.", n)
+		if last, ok := e.lastMissPage[jobID]; ok && now.Sub(last) < missPageEvery && !now.Before(last) {
+			continue
 		}
-		e.pageJob(je.job, notify.Fail, "missed", body)
+		delete(e.pageBatch, jobID)
+		e.lastMissPage[jobID] = now
+		title := "coalesced"
+		if pc.missed > 0 {
+			title = "missed"
+		}
+		e.pageJob(je.job, notify.Fail, title, pc.body())
 	}
+}
+
+func (e *Engine) pageCountFor(jobID string) *pageCount {
+	pc := e.pageBatch[jobID]
+	if pc == nil {
+		pc = &pageCount{}
+		e.pageBatch[jobID] = pc
+	}
+	return pc
+}
+
+// addPageCounts adds occurrences a materialise dropped to the job's next page.
+func (e *Engine) addPageCounts(jobID string, coalesced, expired int) {
+	if coalesced <= 0 && expired <= 0 {
+		return
+	}
+	pc := e.pageCountFor(jobID)
+	pc.coalesced += coalesced
+	pc.expired += expired
+	if expired >= maxExpiredCount {
+		pc.capped = true
+	}
+}
+
+func (pc *pageCount) body() string {
+	var s []string
+	switch {
+	case pc.missed == 1:
+		s = append(s, "1 run missed its max_late window and was not run.")
+	case pc.missed > 1:
+		s = append(s, fmt.Sprintf("%d runs missed their max_late window and were not run.", pc.missed))
+	}
+	switch {
+	case pc.coalesced == 1:
+		s = append(s, "1 occurrence was coalesced into a later run because dispatch was behind schedule.")
+	case pc.coalesced > 1:
+		s = append(s, fmt.Sprintf("%d occurrences were coalesced into one run because dispatch was behind schedule.", pc.coalesced))
+	}
+	if pc.expired > 0 {
+		n := fmt.Sprintf("%d occurrences", pc.expired)
+		switch {
+		case pc.capped:
+			n = "At least " + n
+		case pc.expired == 1:
+			n = "1 occurrence"
+		}
+		s = append(s, n+" expired while the runner was down or the job was blocked.")
+	}
+	return strings.Join(s, " ")
 }
 
 // startExec runs the target off the loop.

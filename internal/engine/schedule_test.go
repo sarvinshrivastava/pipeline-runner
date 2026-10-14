@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -356,4 +358,198 @@ func TestReconcileRepairsDroppedInsert(t *testing.T) {
 	}
 	h.advance(61 * time.Second)
 	h.waitStatus(id, model.StatusSuccess)
+}
+
+// coalescedSeries reads plr_coalesced_occurrences_total as "job|client|reason" → value.
+func coalescedSeries(t *testing.T, h *harness) map[string]float64 {
+	t.Helper()
+	mfs, err := h.metrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, mf := range mfs {
+		if mf.GetName() != "plr_coalesced_occurrences_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			l := map[string]string{}
+			for _, p := range m.GetLabel() {
+				l[p.GetName()] = p.GetValue()
+			}
+			out[l["job"]+"|"+l["client"]+"|"+l["reason"]] = m.GetCounter().GetValue()
+		}
+	}
+	return out
+}
+
+// phased hands each exec call the gate current at its start (nil: succeed).
+type phased struct {
+	mu sync.Mutex
+	g  *gate
+}
+
+func (p *phased) set(g *gate) {
+	p.mu.Lock()
+	p.g = g
+	p.mu.Unlock()
+}
+
+func (p *phased) behaviour(ctx context.Context, in targetInput) targetResult {
+	p.mu.Lock()
+	g := p.g
+	p.mu.Unlock()
+	if g == nil {
+		return okResult()
+	}
+	return g.behaviour(okResult())(ctx, in)
+}
+
+func secQueuePolicy() *model.PolicyIn {
+	return &model.PolicyIn{Overlap: ptr(model.OverlapQueue), MaxLateSec: ptr(int64(600)), JitterSec: ptr(int64(0)), TimeoutSec: ptr(int64(3600))}
+}
+
+// queueBacklog runs an every-second overlap=queue job whose first run (T)
+// blocks for 5 s: T+1 parks, and its claim at T+5 coalesces T+2..T+4 into
+// T+5. Exec calls from then on use next.
+func queueBacklog(t *testing.T, next *gate) (*harness, *phased, model.Job) {
+	t.Helper()
+	h := newHarness(t, withMetrics())
+	ph := &phased{}
+	g := newGate()
+	ph.set(g)
+	h.exec.set(ph.behaviour)
+	j := h.create(cronJob("sec", "* * * * * *", secQueuePolicy()))
+	first := h.runs(j.ID)[0]
+	h.advance(time.Second) // T: claimed
+	h.waitStatus(first.ID, model.StatusRunning)
+	h.advance(time.Second) // T+1: parks behind T
+	h.advance(4 * time.Second)
+	ph.set(next)
+	g.open()
+	return h, ph, j
+}
+
+func TestBacklogCoalescedCountedAndPaged(t *testing.T) {
+	h, _, j := queueBacklog(t, nil)
+	h.waitFor("coalesced page", func() bool { return len(h.pager.bodies("coalesced")) == 1 })
+	if body := h.pager.bodies("coalesced")[0]; !strings.Contains(body, "3 occurrences were coalesced") {
+		t.Fatalf("page body: %q", body)
+	}
+	got := coalescedSeries(t, h)
+	if v := got["sec|"+j.ClientID+"|backlog"]; v != 3 {
+		t.Fatalf("backlog = %v, want 3 (%v)", v, got)
+	}
+	if _, ok := got["sec|"+j.ClientID+"|expired"]; ok {
+		t.Fatalf("nothing expired: %v", got)
+	}
+}
+
+func TestCoalescedPagesRateLimited(t *testing.T) {
+	g2 := newGate()
+	h, ph, j := queueBacklog(t, g2)
+	h.waitFor("first page", func() bool { return len(h.pager.bodies("coalesced")) == 1 })
+	// T+1 now runs blocked on g2 and T+5 parks behind it: a second backlog.
+	h.advance(5 * time.Second)
+	ph.set(nil)
+	g2.open()
+	waitCount(h, 0, model.StatusRunning)
+	if n := len(h.pager.bodies("coalesced")); n != 1 {
+		t.Fatalf("a second backlog within 10 min must not page: %d pages", n)
+	}
+	if v := coalescedSeries(t, h)["sec|"+j.ClientID+"|backlog"]; v != 7 {
+		t.Fatalf("backlog = %v, want 3 + 4", v)
+	}
+	if _, err := h.e.SetEnabled(context.Background(), j.ID, false); err != nil { // stop new occurrences
+		t.Fatal(err)
+	}
+	h.advance(10*time.Minute + time.Second)
+	h.waitFor("held page", func() bool { return len(h.pager.bodies("coalesced")) == 2 })
+	if body := h.pager.bodies("coalesced")[1]; !strings.Contains(body, "4 occurrences were coalesced") {
+		t.Fatalf("held page body: %q", body)
+	}
+}
+
+func TestOutageExpiredCountCapped(t *testing.T) {
+	h := newHarness(t, withMetrics())
+	j := h.create(cronJob("sec", "* * * * * *", &model.PolicyIn{MaxLateSec: ptr(int64(60))}))
+	h.clk.Set(t0.Add(3 * time.Hour))
+	h.sync()
+	h.waitFor("outage page", func() bool { return len(h.pager.bodies("missed")) == 1 })
+	body := h.pager.bodies("missed")[0]
+	if !strings.Contains(body, "At least 1000 occurrences expired") || !strings.Contains(body, "1 run missed") {
+		t.Fatalf("page body: %q", body)
+	}
+	got := coalescedSeries(t, h)
+	if v := got["sec|"+j.ClientID+"|expired"]; v != maxExpiredCount {
+		t.Fatalf("expired = %v, want %d", v, maxExpiredCount)
+	}
+	if v := got["sec|"+j.ClientID+"|backlog"]; v != 59 {
+		t.Fatalf("backlog = %v, want 59 (the max_late window)", v)
+	}
+}
+
+func TestDeletedJobDropsCountsAndSeries(t *testing.T) {
+	h := newHarness(t, withMetrics())
+	ctx := context.Background()
+	other := h.addClient("other")
+	p := &model.PolicyIn{MaxLateSec: ptr(int64(60))}
+	a := h.create(cronJob("dup", "* * * * * *", p))
+	b, err := h.e.CreateJob(ctx, other, cronJob("dup", "* * * * * *", p), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+	h.advance(3 * time.Minute) // outage: both page at once
+	h.waitFor("first pages", func() bool { return h.pager.count("dup: missed") == 2 })
+	h.advance(2 * time.Minute) // a second outage within 10 min: held
+	var heldA, heldB bool
+	h.onLoop(func() { heldA, heldB = h.e.pageBatch[a.ID] != nil, h.e.pageBatch[b.ID] != nil })
+	if !heldA || !heldB {
+		t.Fatalf("held counts: a %v, b %v", heldA, heldB)
+	}
+	if err := h.e.DeleteJob(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+	for k := range coalescedSeries(t, h) {
+		if strings.HasPrefix(k, "dup|"+a.ClientID+"|") {
+			t.Fatalf("deleted job's series kept: %s", k)
+		}
+	}
+	if _, ok := coalescedSeries(t, h)["dup|"+b.ClientID+"|expired"]; !ok {
+		t.Fatal("the other client's same-name job lost its series")
+	}
+	h.advance(11 * time.Minute)
+	h.waitFor("b's held page", func() bool { return h.pager.count("dup: missed") == 3 })
+	h.sync()
+	if n := h.pager.count("dup: missed"); n != 3 {
+		t.Fatalf("pages = %d: the deleted job paged", n)
+	}
+}
+
+func TestPatchCoalescesThroughAPI(t *testing.T) {
+	h := newHarness(t, withMetrics())
+	g := newGate()
+	h.exec.set(g.behaviour(okResult()))
+	j := h.create(cronJob("sec", "* * * * * *", secQueuePolicy()))
+	first := h.runs(j.ID)[0]
+	h.advance(time.Second) // T: claimed
+	h.waitStatus(first.ID, model.StatusRunning)
+	h.advance(time.Second) // T+1 parks
+	h.advance(4 * time.Second)
+	p := secQueuePolicy()
+	p.TimeoutSec = ptr(int64(1800))
+	if _, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Policy: p}); err != nil {
+		t.Fatal(err)
+	}
+	// The PATCH re-creates T+1 at T+5, collapsing T+1..T+4.
+	if v := coalescedSeries(t, h)["sec|"+j.ClientID+"|backlog"]; v != 4 {
+		t.Fatalf("backlog = %v, want 4", v)
+	}
+	h.waitFor("patch page", func() bool { return len(h.pager.bodies("coalesced")) == 1 })
+	if body := h.pager.bodies("coalesced")[0]; !strings.Contains(body, "4 occurrences were coalesced") {
+		t.Fatalf("page body: %q", body)
+	}
+	g.open()
 }

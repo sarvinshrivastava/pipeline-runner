@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sarvinshrivastava/pipeline-runner/internal/metrics"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
@@ -41,6 +42,19 @@ func (p *fakePager) titles() []string {
 	out := make([]string, len(p.msgs))
 	for i, m := range p.msgs {
 		out[i] = m.Title
+	}
+	return out
+}
+
+// bodies returns the bodies of pages whose title contains substr.
+func (p *fakePager) bodies(substr string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	for _, m := range p.msgs {
+		if bytes.Contains([]byte(m.Title), []byte(substr)) {
+			out = append(out, m.Body)
+		}
 	}
 	return out
 }
@@ -96,11 +110,16 @@ type harness struct {
 	owner   model.Principal
 	dir     string
 	maxHTTP int
+	metrics *metrics.Metrics
 }
 
 type opt func(*harness)
 
 func withMaxHTTP(n int) opt { return func(h *harness) { h.maxHTTP = n } }
+
+func withMetrics() opt {
+	return func(h *harness) { h.metrics = metrics.New(func() float64 { return 0 }) }
+}
 
 func newHarness(t *testing.T, opts ...opt) *harness {
 	t.Helper()
@@ -130,7 +149,7 @@ func (h *harness) addClient(name string) model.Principal {
 func (h *harness) start() {
 	h.e = New(Deps{
 		Store: h.st, Clock: h.clk, Executors: map[string]target.Executor{model.TargetHTTP: h.exec},
-		Secrets: fakeSecrets{}, Pager: h.pager, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Secrets: fakeSecrets{}, Pager: h.pager, Metrics: h.metrics, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		RunTokenKey: []byte("run-key"), EnvKey: bytes.Repeat([]byte{1}, 32), MaxHTTPInflight: h.maxHTTP, MaxContainers: 4,
 		DataDir: h.dir, RetentionDays: 60, Rand: func(int64) int64 { return 0 },
 	})

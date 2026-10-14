@@ -269,6 +269,25 @@ func (e *Engine) reconcile(now time.Time) {
 		fresh[j.ID] = newJobEntry(j, now)
 	}
 	e.jobs = fresh
+	// Jobs deleted behind the loop's back (a lost event) take their page
+	// counts and coalesced series with them.
+	for id := range e.pageBatch {
+		if fresh[id] == nil {
+			delete(e.pageBatch, id)
+		}
+	}
+	for id := range e.lastMissPage {
+		if fresh[id] == nil {
+			delete(e.lastMissPage, id)
+		}
+	}
+	if m := e.d.Metrics; m != nil {
+		live := make(map[[2]string]bool, len(fresh))
+		for _, je := range fresh {
+			live[[2]string{je.job.Name, je.job.ClientID}] = true
+		}
+		m.SweepCoalesced(func(job, client string) bool { return live[[2]string{job, client}] })
+	}
 
 	pending, err := store.RunsByStatus(ctx, e.st.R, model.StatusPending)
 	if err != nil {

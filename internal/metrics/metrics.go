@@ -4,6 +4,7 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -25,6 +26,12 @@ type Metrics struct {
 	SkippedTotal     *prometheus.CounterVec
 	UnflushedWrites  prometheus.Gauge
 	EngineLoopAgeSec prometheus.GaugeFunc
+	// Coalesced counts cron occurrences that never got a run: reason
+	// "backlog" (collapsed inside max_late) or "expired" (older than max_late).
+	Coalesced *prometheus.CounterVec
+
+	seriesMu sync.Mutex
+	series   map[[2]string]struct{} // {job, client} pairs with a Coalesced series
 }
 
 // New builds the collectors. loopAge reports the engine loop age in seconds.
@@ -56,11 +63,49 @@ func New(loopAge func() float64) *Metrics {
 		EngineLoopAgeSec: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "plr_engine_loop_age_seconds", Help: "Seconds since the engine loop last completed an iteration.",
 		}, loopAge),
+		Coalesced: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "plr_coalesced_occurrences_total", Help: "Cron occurrences coalesced into a later run instead of running.",
+		}, []string{"job", "client", "reason"}),
+		series: map[[2]string]struct{}{},
 	}
 	m.Registry.MustRegister(m.FireDelay, m.RunsTotal, m.RunDuration, m.Late, m.PendingRuns, m.Inflight, m.QueueDepth,
-		m.WaitingRuns, m.SkippedTotal, m.UnflushedWrites, m.EngineLoopAgeSec,
+		m.WaitingRuns, m.SkippedTotal, m.UnflushedWrites, m.EngineLoopAgeSec, m.Coalesced,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
+}
+
+// AddCoalesced adds n to a job's coalesced series. Safe from any goroutine.
+func (m *Metrics) AddCoalesced(job, client, reason string, n int) {
+	if n <= 0 {
+		return
+	}
+	m.seriesMu.Lock()
+	defer m.seriesMu.Unlock()
+	m.series[[2]string{job, client}] = struct{}{}
+	m.Coalesced.WithLabelValues(job, client, reason).Add(float64(n))
+}
+
+// DeleteCoalesced drops every series of one job.
+func (m *Metrics) DeleteCoalesced(job, client string) {
+	m.seriesMu.Lock()
+	defer m.seriesMu.Unlock()
+	m.deleteCoalescedLocked([2]string{job, client})
+}
+
+// SweepCoalesced drops the series of every job for which live is false.
+func (m *Metrics) SweepCoalesced(live func(job, client string) bool) {
+	m.seriesMu.Lock()
+	defer m.seriesMu.Unlock()
+	for k := range m.series {
+		if !live(k[0], k[1]) {
+			m.deleteCoalescedLocked(k)
+		}
+	}
+}
+
+func (m *Metrics) deleteCoalescedLocked(k [2]string) {
+	delete(m.series, k)
+	m.Coalesced.DeletePartialMatch(prometheus.Labels{"job": k[0], "client": k[1]})
 }
 
 // Handler serves the registry.
