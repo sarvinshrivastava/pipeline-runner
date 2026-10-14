@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -345,4 +346,47 @@ func TestRowCacheDoesNotLeak(t *testing.T) {
 	if rows != 0 {
 		t.Fatalf("rows left after drain: %d", rows)
 	}
+}
+
+func TestWakeKeepsHeadOnTransientReadError(t *testing.T) {
+	h := newHarness(t, withMaxHTTP(1))
+	g := newGate()
+	h.exec.set(g.behaviour(okResult()))
+	j := h.create(invokeJob("f", nil))
+	a := invoke(t, h, j.ID) // holds the only slot
+	waitJobRun(h, j.ID, a.ID, model.StatusRunning)
+
+	big := json.RawMessage(`{"pad":"` + string(bytes.Repeat([]byte("x"), 9<<10)) + `"}`) // too big to cache
+	b := pendingInvoke(j, h.clk.Now(), big)
+	if err := store.InsertRun(context.Background(), h.st.W, b); err != nil {
+		t.Fatal(err)
+	}
+	h.onLoop(func() { h.e.pushRun(b) })
+	h.sync()
+	var parked bool
+	h.onLoop(func() { _, parked = h.e.parked[b.ID] })
+	if !parked || h.cached(b.ID) {
+		t.Fatalf("setup: parked %v, cached %v; want parked and uncached", parked, h.cached(b.ID))
+	}
+
+	var getRun string
+	h.st.R.SetQueryHook(func(q string) { getRun = q })
+	_, _ = store.GetRun(context.Background(), h.st.R, "probe")
+	h.st.R.SetQueryHook(nil)
+	h.st.R.SetFaultHook(func(q string) error {
+		if q == getRun {
+			return errors.New("transient read failure")
+		}
+		return nil
+	})
+	g.open() // a finishes, its release wakes the list, the head's read fails
+	waitJobRun(h, j.ID, a.ID, model.StatusSuccess)
+	h.onLoop(func() { _, parked = h.e.parked[b.ID] })
+	if !parked {
+		t.Fatal("a transient read error must leave the head parked, not drop it")
+	}
+
+	h.st.R.SetFaultHook(nil)
+	h.onLoop(func() { h.e.wake("pool:" + poolHTTP) })
+	waitJobRun(h, j.ID, b.ID, model.StatusSuccess)
 }

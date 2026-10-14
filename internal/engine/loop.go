@@ -556,6 +556,13 @@ func (e *Engine) wake(list string) {
 		}
 		head := ids[0]
 		r, err := e.pendingRow(e.life, head)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			// Transient: unparking would orphan the run (its late-deadline
+			// entry is skipped once it leaves the list). It keeps its place;
+			// the next release or reconcile wakes the list again.
+			e.log.Error("load parked run; leaving it parked", "run", head, "err", err)
+			return
+		}
 		if err != nil || r.Status != model.StatusPending {
 			e.unpark(head)
 			continue
