@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -225,7 +224,7 @@ func TestConcurrentWritersSerialise(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs <- s.Tx(bg, func(tx *sql.Tx) error {
+			errs <- s.Tx(bg, func(tx *Tx) error {
 				r := schedRun(j, t0)
 				r.Kind, r.NominalFor = model.KindInvoke, nil
 				r.ID = fmt.Sprintf("run-%02d", i)

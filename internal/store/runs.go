@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -167,12 +169,13 @@ var mutableRunCols = map[string]bool{
 func Transition(ctx context.Context, q Querier, id string, from []model.Status, to model.Status, f Fields) (bool, error) {
 	set := []string{"status = ?"}
 	args := []any{string(to)}
-	for col, v := range f {
+	// Sorted, so one field set always yields one SQL text (one cached statement).
+	for _, col := range slices.Sorted(maps.Keys(f)) {
 		if !mutableRunCols[col] {
 			return false, fmt.Errorf("store: column %q is not mutable", col)
 		}
 		set = append(set, col+" = ?")
-		args = append(args, sqlValue(v))
+		args = append(args, sqlValue(f[col]))
 	}
 	args = append(args, id)
 	for _, s := range from {
@@ -304,6 +307,7 @@ func DeleteFinishedBefore(ctx context.Context, q Querier, before time.Time, jobI
 		if len(jobIDs) == 0 {
 			return nil, nil
 		}
+		q = Uncached(q) // the IN list's length comes from data
 		jobClause = ` AND job_id IN (` + placeholders(len(jobIDs)) + `)`
 		for _, id := range jobIDs {
 			args = append(args, id)

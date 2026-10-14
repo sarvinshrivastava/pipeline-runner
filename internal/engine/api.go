@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,7 +110,7 @@ func (e *Engine) CreateJob(ctx context.Context, owner model.Principal, in model.
 	now := e.now()
 	j.ID, j.Rev, j.CreatedAt, j.UpdatedAt = newID(), 1, now, now
 	var inserted []model.Run
-	err = e.st.Tx(ctx, func(tx *sql.Tx) error {
+	err = e.st.Tx(ctx, func(tx *store.Tx) error {
 		n, err := store.CountJobs(ctx, tx, owner.ClientID)
 		if err != nil {
 			return err
@@ -177,7 +176,7 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 	var next model.Job
 	var inserted []model.Run
 	var dropped []string
-	err = e.st.Tx(ctx, func(tx *sql.Tx) error {
+	err = e.st.Tx(ctx, func(tx *store.Tx) error {
 		cur, err := store.GetJob(ctx, tx, jobID) // re-read inside the transaction
 		if err != nil {
 			return err
@@ -254,7 +253,7 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 	var j model.Job
 	var inserted []model.Run
 	var dropped []string
-	err := e.st.Tx(ctx, func(tx *sql.Tx) error {
+	err := e.st.Tx(ctx, func(tx *store.Tx) error {
 		var err error
 		j, err = store.GetJob(ctx, tx, jobID)
 		if errors.Is(err, store.ErrNotFound) {
@@ -323,7 +322,7 @@ func (e *Engine) SetEnabled(ctx context.Context, jobID string, enabled bool) (mo
 func (e *Engine) DeleteJob(ctx context.Context, jobID string) error {
 	now := e.now()
 	var released, running, dropped []string
-	err := e.st.Tx(ctx, func(tx *sql.Tx) error {
+	err := e.st.Tx(ctx, func(tx *store.Tx) error {
 		if _, err := store.GetJob(ctx, tx, jobID); errors.Is(err, store.ErrNotFound) {
 			return ErrNotFound
 		} else if err != nil {
@@ -382,7 +381,7 @@ func runsOfJob(ctx context.Context, q store.Querier, jobID string, statuses ...m
 func (e *Engine) Invoke(ctx context.Context, jobID string, payload json.RawMessage, asOf *time.Time, commit Commit) (model.Run, error) {
 	now := e.now()
 	var r model.Run
-	err := e.st.Tx(ctx, func(tx *sql.Tx) error {
+	err := e.st.Tx(ctx, func(tx *store.Tx) error {
 		j, err := store.GetJob(ctx, tx, jobID)
 		if errors.Is(err, store.ErrNotFound) {
 			return ErrNotFound
@@ -430,7 +429,7 @@ func (e *Engine) Adhoc(ctx context.Context, owner model.Principal, in model.Adho
 	r := model.Run{ID: id, JobName: model.AdhocJobName, ClientID: owner.ClientID, Kind: model.KindAdhoc, Attempt: 1,
 		ChainRootID: id, Status: model.StatusPending, ScheduledFor: now, OriginFor: now, ContextFor: now,
 		LatenessRef: now, AdhocSpec: &spec, Payload: in.Payload, CreatedAt: now}
-	err = e.st.Tx(ctx, func(tx *sql.Tx) error {
+	err = e.st.Tx(ctx, func(tx *store.Tx) error {
 		if err := store.InsertRun(ctx, tx, r); err != nil {
 			return err
 		}

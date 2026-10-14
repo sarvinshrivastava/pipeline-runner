@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -164,7 +163,7 @@ func (e *Engine) finalize(r model.Run, from []model.Status, o outcome) bool {
 
 	won := false
 	write := func(ctx context.Context) error {
-		return e.st.Tx(ctx, func(tx *sql.Tx) error {
+		return e.st.Tx(ctx, func(tx *store.Tx) error {
 			ok, err := store.Transition(ctx, tx, r.ID, from, o.status, fields)
 			if err != nil {
 				return err

@@ -12,6 +12,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// Querier is satisfied by *sql.DB and *sql.Tx.
+// Querier is satisfied by *DB, *Tx, *sql.DB and *sql.Tx.
 type Querier interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -35,8 +36,8 @@ type Querier interface {
 
 // Store holds the writer and reader pools.
 type Store struct {
-	W *sql.DB // single writer connection
-	R *sql.DB // read-only pool
+	W *DB // single writer connection
+	R *DB // read-only pool
 }
 
 // ErrNotFound is returned when a row does not exist.
@@ -66,7 +67,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	r.SetMaxOpenConns(4)
-	return &Store{W: w, R: r}, nil
+	r.SetMaxIdleConns(4) // prepared statements live on connections; keep them
+	log := slog.Default()
+	return &Store{W: newDB(w, log), R: newDB(r, log)}, nil
 }
 
 func dsn(path string, readOnly bool) string {
@@ -87,9 +90,14 @@ func (s *Store) Close() error {
 	return errors.Join(s.R.Close(), s.W.Close())
 }
 
+// Begin starts a write transaction.
+func (s *Store) Begin(ctx context.Context) (*Tx, error) {
+	return s.W.BeginTx(ctx, nil)
+}
+
 // Tx runs fn in a write transaction.
-func (s *Store) Tx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := s.W.BeginTx(ctx, nil)
+func (s *Store) Tx(ctx context.Context, fn func(tx *Tx) error) error {
+	tx, err := s.Begin(ctx)
 	if err != nil {
 		return err
 	}
