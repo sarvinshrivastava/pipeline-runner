@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +65,11 @@ func TestShutdownEndsStalledLogStream(t *testing.T) {
 	items := call("GET", "/v1/runs?job="+job, tok, nil)["items"].([]any)
 	runID := items[0].(map[string]any)["id"].(string)
 
+	// A log far larger than the socket buffers, so the server's writes block.
+	logPath := filepath.Join(cfg.DataDir, "v2", "logs", runID+".log")
+	if err := os.WriteFile(logPath, bytes.Repeat([]byte("0123456789abcdef\n"), 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	conn, err := net.Dial("tcp", base)
 	if err != nil {
 		t.Fatal(err)
@@ -76,10 +83,11 @@ func TestShutdownEndsStalledLogStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	line, err := bufio.NewReader(conn).ReadString('\n') // read the status line, then never again
+	line, err := bufio.NewReader(io.LimitReader(conn, 64)).ReadString('\n') // the status line, then never again
 	if err != nil || !strings.HasPrefix(line, "HTTP/1.1 200") {
 		t.Fatalf("stream did not open: %q %v", line, err)
 	}
+	time.Sleep(time.Second) // the server fills the socket and blocks in a write
 	start := time.Now()
 	cancel()
 	select {

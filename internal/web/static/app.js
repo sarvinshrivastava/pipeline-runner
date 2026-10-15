@@ -190,12 +190,27 @@ function stopLogStream() {
 
 function setLog(text) { $("log-body").textContent = text; }
 
+// appendLog adds text nodes (no full rewrite per event) and trims in large
+// steps once the dialog holds more than LOG_CAP characters.
 function appendLog(text) {
   const body = $("log-body");
-  let t = body.dataset.live === "1" ? body.textContent + text : text;
-  body.dataset.live = "1";
-  if (t.length > LOG_CAP) t = "…trimmed…\n" + t.slice(t.length - LOG_CAP);
-  body.textContent = t;
+  if (body.dataset.live !== "1") { body.textContent = ""; body.dataset.live = "1"; body.dataset.len = "0"; }
+  const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 4;
+  body.append(document.createTextNode(text));
+  let len = Number(body.dataset.len) + text.length;
+  if (len > LOG_CAP * 1.25) {
+    const t = body.textContent;
+    body.textContent = "…trimmed…\n" + t.slice(t.length - LOG_CAP);
+    len = body.textContent.length;
+  }
+  body.dataset.len = String(len);
+  if (atBottom) body.scrollTop = body.scrollHeight;
+}
+
+function showNextAttempt(id) {
+  const btn = el("button", { class: "btn btn-sm", type: "button", id: "next-attempt" }, "Open next attempt →");
+  btn.addEventListener("click", () => openRun(id));
+  $("log-body").after(btn);
 }
 
 function setRunTitle(run, status) { $("run-title").textContent = `${run.job_name} · ${status}`; }
@@ -203,6 +218,8 @@ function setRunTitle(run, status) { $("run-title").textContent = `${run.job_name
 async function openRun(id) {
   stopLogStream();
   currentRunId = id;
+  const next = $("next-attempt");
+  if (next) next.remove();
   let run;
   try { run = await api("GET", `/v1/runs/${id}`); } catch (e) { alertError(e); return; }
   if (currentRunId !== id) return; // another run was opened meanwhile
@@ -237,10 +254,12 @@ async function followRun(run, lastId, tries) {
     if (!ctl.signal.aborted) retryFollow(run, lastId, tries);
     return;
   }
-  if (currentRunId !== id || ctl.signal.aborted) return;
-  if (res.status === 401) { signOut("Token rejected."); return; }
-  if (res.status === 429) { await loadLogSnapshot(id, "Too many live log streams open; showing a snapshot."); return; }
-  if (!res.ok) { retryFollow(run, lastId, tries); return; }
+  if (currentRunId !== id || ctl.signal.aborted) { ctl.abort(); return; }
+  if (res.status === 401) { ctl.abort(); signOut("Token rejected."); return; }
+  if (res.status === 429) { ctl.abort(); await loadLogSnapshot(id, "Too many live log streams open; showing a snapshot."); return; }
+  if (res.status >= 400 && res.status < 500) { ctl.abort(); appendLog(`\n[live log unavailable: ${res.status}]`); return; }
+  if (!res.ok) { ctl.abort(); retryFollow(run, lastId, tries); return; }
+  tries = 0; // connected: a later drop gets a fresh set of retries
   if (!lastId) setLog("");
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   let buf = "";
@@ -272,7 +291,8 @@ async function followRun(run, lastId, tries) {
 }
 
 function retryFollow(run, lastId, tries) {
-  if (tries >= 5 || currentRunId !== run.id) return;
+  if (currentRunId !== run.id) return;
+  if (tries >= 5) { appendLog("\n[live log disconnected; reopen the run]"); return; }
   const delay = 3000 + Math.floor(Math.random() * 1000);
   setTimeout(() => { if (currentRunId === run.id && $("run-dialog").open) followRun(run, lastId, tries + 1); }, delay);
 }
@@ -287,7 +307,9 @@ function onStreamEvent(run, name, data, lastId, tries) {
   setRunTitle(run, msg.status);
   switch (msg.reason) {
     case "unauthorized": signOut("Token rejected."); break;
-    case "timeout": setTimeout(() => followRun(run, lastId, 0), 0); break;
+    case "timeout":
+      setTimeout(() => { if (currentRunId === run.id && $("run-dialog").open) followRun(run, lastId, 0); }, 0);
+      break;
     case "shutdown": retryFollow(run, lastId, tries); break;
     case "deleted": appendLog("\n[run deleted]"); break;
     case "truncated": appendLog("\n[log was rewritten; reopen the run]"); break;
@@ -296,7 +318,7 @@ function onStreamEvent(run, name, data, lastId, tries) {
       api("GET", `/v1/runs/${run.id}`).then((r) => {
         if (currentRunId === run.id) $("run-json").textContent = JSON.stringify(r, null, 2);
       }).catch(() => {});
-      if (msg.successor_run_id) appendLog(`\n[next attempt: ${msg.successor_run_id}]`);
+      if (msg.successor_run_id) showNextAttempt(msg.successor_run_id);
   }
   return true;
 }
@@ -417,7 +439,12 @@ document.addEventListener("DOMContentLoaded", () => {
   $("client-save").addEventListener("click", saveClient);
   $("run-close").addEventListener("click", () => $("run-dialog").close());
   // close fires for the button and for Escape alike.
-  $("run-dialog").addEventListener("close", () => { stopLogStream(); currentRunId = null; });
+  $("run-dialog").addEventListener("close", () => {
+    stopLogStream();
+    currentRunId = null;
+    const next = $("next-attempt");
+    if (next) next.remove();
+  });
 
   health();
   setInterval(health, 30000);

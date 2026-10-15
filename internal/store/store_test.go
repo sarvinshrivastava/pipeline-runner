@@ -261,3 +261,29 @@ func newV7() (string, error) {
 	id, err := uuid.NewV7()
 	return id.String(), err
 }
+
+func TestRunStatusAndSuccessorOf(t *testing.T) {
+	s := open(t)
+	_, j := seed(t, s)
+	root := schedRun(j, t0)
+	if err := InsertRun(bg, s.W, root); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := RunStatus(bg, s.R, root.ID); err != nil || st != model.StatusPending {
+		t.Fatalf("status %s %v", st, err)
+	}
+	if _, err := RunStatus(bg, s.R, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing run: %v", err)
+	}
+	if next, err := SuccessorOf(bg, s.R, root); err != nil || next != "" {
+		t.Fatalf("no successor yet: %q %v", next, err)
+	}
+	retry := root
+	retry.ID, retry.Kind, retry.Attempt, retry.ParentRunID, retry.NominalFor = uuid.NewString(), model.KindRetry, 2, root.ID, nil
+	if err := InsertRun(bg, s.W, retry); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := SuccessorOf(bg, s.R, root); err != nil || next != retry.ID {
+		t.Fatalf("successor %q %v, want %s", next, err, retry.ID)
+	}
+}

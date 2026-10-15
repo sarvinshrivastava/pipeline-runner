@@ -66,7 +66,7 @@ func New(d Deps) *Server {
 	}
 	s := &Server{d: d, mux: http.NewServeMux(), limiter: newLimiter(10, 5*time.Minute, 10000, d.Now), timing: defaultStreamTiming()}
 	if d.StreamTiming != nil {
-		s.timing = *d.StreamTiming
+		s.timing = d.StreamTiming.withDefaults()
 	}
 	s.streams = &streamLimits{per: map[string]int{}, maxPer: streamMaxPerClient, maxTotal: streamMaxTotal}
 	if d.StreamMaxPerClient > 0 {

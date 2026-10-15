@@ -731,3 +731,20 @@ func TestRemovedJobRunsLeavePendingCount(t *testing.T) {
 		t.Fatal("cancelled run still counted as pending")
 	}
 }
+
+func TestStoppingClosesOnStop(t *testing.T) {
+	h := newHarness(t)
+	select {
+	case <-h.e.Stopping():
+		t.Fatal("closed before Stop")
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.e.Stop(ctx, time.Now())
+	select {
+	case <-h.e.Stopping():
+	default:
+		t.Fatal("Stopping not closed after Stop")
+	}
+}

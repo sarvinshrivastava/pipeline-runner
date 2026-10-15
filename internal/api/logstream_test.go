@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sarvinshrivastava/pipeline-runner/internal/engine"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/target"
 )
@@ -577,5 +580,219 @@ func TestFollowCatchUpCap(t *testing.T) {
 	ev := s.next()
 	if ev.name != "log" || ev.id != "100" || ev.data != "[60 bytes skipped]\n" {
 		t.Fatalf("skip marker %q id %s", ev.data, ev.id)
+	}
+}
+
+// rawFollow opens a stream on a raw connection and never reads past the
+// status line, so the server's writes block once the socket buffers fill.
+func rawFollow(t *testing.T, e *env, tok, runID string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(e.url, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(4096)
+	}
+	req := "GET /v1/runs/" + runID + "/logs?follow=1 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + tok + "\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := bufio.NewReader(io.LimitReader(conn, 64)).ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "HTTP/1.1 200") {
+		t.Fatalf("stream did not open: %q %v", line, err)
+	}
+	return conn
+}
+
+func bigLog(t *testing.T, e *env, runID string, n int) {
+	t.Helper()
+	appendLog(t, e, runID, strings.Repeat("0123456789abcdef\n", n/17+1))
+}
+
+func TestFollowStalledReaderReleasesSlot(t *testing.T) {
+	e := newEnvWith(t, nil, func(d *Deps) {
+		tm := fastStreams
+		tm.WriteGrace = 200 * time.Millisecond
+		d.StreamTiming = &tm
+		d.StreamMaxPerClient = 1
+	})
+	_, tok := e.client("a", all...)
+	id, release := heldRun(t, e, tok)
+	defer release()
+	bigLog(t, e, id, 8<<20)
+	rawFollow(t, e, tok, id)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if r := e.do("GET", "/v1/runs/"+id+"/logs?follow=1&offset=999999999", tok, nil, "Range", "x"); r.status != 429 {
+			break // the stalled stream gave its slot back (this request then reads its stream to end)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a stalled reader kept its slot past WriteGrace")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestFollowTotalLimit(t *testing.T) {
+	e := streamEnv(t, func(d *Deps) { d.StreamMaxTotal = 2 })
+	_, tokA := e.client("a", all...)
+	_, tokB := e.client("b", all...)
+	_, tokC := e.client("c", all...)
+	idA, relA := heldRun(t, e, tokA)
+	defer relA()
+	idB, relB := heldRun(t, e, tokB)
+	defer relB()
+	idC, relC := heldRun(t, e, tokC)
+	defer relC()
+	e.follow(tokA, idA, "").next()
+	e.follow(tokB, idB, "").next()
+	if r := e.do("GET", "/v1/runs/"+idC+"/logs?follow=1", tokC, nil); r.status != 429 || r.code() != "too_many_streams" {
+		t.Fatalf("over the total: %d %s", r.status, r.body)
+	}
+}
+
+func TestFollowStatusChangesMidStream(t *testing.T) {
+	e := newEnvWith(t, func(d *engine.Deps) { d.MaxHTTPInflight = 1 }, func(d *Deps) {
+		tm := fastStreams
+		d.StreamTiming = &tm
+	})
+	_, tok := e.client("a", all...)
+	_, release := heldRun(t, e, tok)
+	job := e.do("POST", "/v1/jobs", tok, fnJob("second")).json(t)["id"].(string)
+	id := e.do("POST", "/v1/jobs/"+job+"/invoke", tok, nil).json(t)["id"].(string)
+	s := e.follow(tok, id, "")
+	if ev := s.next(); ev.name != "status" || !strings.Contains(ev.data, "pending") {
+		t.Fatalf("first: %+v", ev)
+	}
+	second := make(chan struct{})
+	e.exec.set(func(ctx context.Context, _ target.ExecInput) target.Result {
+		select {
+		case <-second:
+		case <-ctx.Done():
+		}
+		code := 200
+		return target.Result{Status: model.StatusSuccess, HTTPStatus: &code}
+	})
+	release() // the slot frees: the second run starts and holds
+	if ev := s.next(); ev.name != "status" || !strings.Contains(ev.data, `"running"`) {
+		t.Fatalf("want a running status event: %+v", ev)
+	}
+	close(second)
+	if end := endOf(t, s.until("end")); end["status"] != "success" {
+		t.Fatalf("end %v", end)
+	}
+}
+
+func TestFollowResumeInsideRune(t *testing.T) {
+	e := streamEnv(t, nil)
+	_, tok := e.client("a", all...)
+	id, release := heldRun(t, e, tok)
+	defer release()
+	appendLog(t, e, id, "a→b") // the arrow is bytes 1..3
+	s := e.follow(tok, id, "&offset=2")
+	s.next()
+	if ev := s.next(); ev.data != "b" || ev.id != "5" {
+		t.Fatalf("resume inside a rune: %+v", ev)
+	}
+}
+
+func TestStreamTimingZeroFieldsTakeDefaults(t *testing.T) {
+	tm := StreamTiming{Poll: time.Millisecond}.withDefaults()
+	d := defaultStreamTiming()
+	if tm.Poll != time.Millisecond || tm.Status != d.Status || tm.Ping != d.Ping || tm.Reauth != d.Reauth ||
+		tm.MaxAge != d.MaxAge || tm.WriteGrace != d.WriteGrace || tm.ShutdownGrace != d.ShutdownGrace {
+		t.Fatalf("%+v", tm)
+	}
+}
+
+func TestFollowSkipsWhenFallingBehind(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes over 16 MiB")
+	}
+	e := newEnvWith(t, nil, func(d *Deps) {
+		tm := fastStreams
+		tm.Poll = time.Hour // nothing is read until the drain
+		d.StreamTiming = &tm
+	})
+	_, tok := e.client("a", all...)
+	id, release := heldRun(t, e, tok)
+	appendLog(t, e, id, "start\n")
+	s := e.follow(tok, id, "")
+	s.next()
+	if ev := s.next(); ev.data != "start\n" {
+		t.Fatalf("%+v", ev)
+	}
+	bigLog(t, e, id, streamCatchUpCap+1000)
+	release()
+	evs := s.until("end")
+	var marker *sseEvent
+	for i := range evs {
+		if evs[i].name == "log" && strings.HasPrefix(evs[i].data, "[") && strings.Contains(evs[i].data, "bytes skipped]") {
+			marker = &evs[i]
+			break
+		}
+	}
+	if marker == nil {
+		t.Fatal("no skip marker when the backlog exceeded the cap")
+	}
+	if total := len(logText(evs)) - len(marker.data); total > streamCatchUpCap {
+		t.Fatalf("sent %d bytes after the marker, cap %d", total, streamCatchUpCap)
+	}
+}
+
+// Shutdown must unblock a write stuck on a reader that stopped reading, well
+// before WriteGrace.
+func TestShutdownUnblocksStalledWrite(t *testing.T) {
+	e := newEnvWith(t, nil, func(d *Deps) {
+		tm := fastStreams
+		tm.Poll, tm.WriteGrace, tm.ShutdownGrace = time.Millisecond, 20*time.Second, 200*time.Millisecond
+		d.StreamTiming = &tm
+		d.StreamMaxPerClient = 1
+	})
+	_, tok := e.client("a", all...)
+	id, release := heldRun(t, e, tok)
+	defer release()
+	bigLog(t, e, id, 12<<20)
+	rawFollow(t, e, tok, id)
+	time.Sleep(time.Second) // the socket fills and the handler blocks in a write
+	start := time.Now()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		e.eng.Stop(ctx, time.Now())
+	}()
+	for e.srv.streams.open() > 0 {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("the blocked stream outlived shutdown")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("stream ended %s after shutdown began", d)
+	}
+}
+
+// A token revoked between re-checks gets no drain when the run finishes.
+func TestFollowNoDrainAfterRevokeAtFinish(t *testing.T) {
+	e := newEnvWith(t, nil, func(d *Deps) {
+		tm := fastStreams
+		tm.Poll, tm.Reauth = time.Hour, time.Hour // only the check before the drain can catch it
+		d.StreamTiming = &tm
+	})
+	idA, tok := e.client("a", all...)
+	id, release := heldRun(t, e, tok)
+	s := e.follow(tok, id, "")
+	s.next()
+	appendLog(t, e, id, "secret tail")
+	if r := e.do("POST", "/v1/clients/"+idA+"/rotate", adminToken, map[string]any{}); r.status != 200 {
+		t.Fatalf("rotate: %d", r.status)
+	}
+	release()
+	evs := s.until("end")
+	if logText(evs) != "" || endOf(t, evs)["reason"] != "unauthorized" {
+		t.Fatalf("%+v", evs)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -32,6 +33,20 @@ type StreamTiming struct {
 func defaultStreamTiming() StreamTiming {
 	return StreamTiming{Poll: 500 * time.Millisecond, Status: time.Second, Ping: 15 * time.Second, Reauth: time.Minute,
 		MaxAge: time.Hour, WriteGrace: 20 * time.Second, ShutdownGrace: 2 * time.Second}
+}
+
+// withDefaults fills every zero field (a zero ticker interval would panic).
+func (t StreamTiming) withDefaults() StreamTiming {
+	d := defaultStreamTiming()
+	for _, f := range []struct{ v, def *time.Duration }{
+		{&t.Poll, &d.Poll}, {&t.Status, &d.Status}, {&t.Ping, &d.Ping}, {&t.Reauth, &d.Reauth},
+		{&t.MaxAge, &d.MaxAge}, {&t.WriteGrace, &d.WriteGrace}, {&t.ShutdownGrace, &d.ShutdownGrace},
+	} {
+		if *f.v <= 0 {
+			*f.v = *f.def
+		}
+	}
+	return t
 }
 
 const (
@@ -59,6 +74,12 @@ func (l *streamLimits) acquire(key string) bool {
 	l.per[key]++
 	l.total++
 	return true
+}
+
+func (l *streamLimits) open() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.total
 }
 
 func (l *streamLimits) release(key string) {
@@ -112,6 +133,16 @@ func (s *Server) followLogs(w http.ResponseWriter, r *http.Request, run model.Ru
 		return
 	}
 	defer s.streams.release(key)
+	defer func() {
+		// The headers are out: ServeHTTP's JSON 500 would corrupt the stream,
+		// so abort the connection instead.
+		if v := recover(); v != nil {
+			if v != http.ErrAbortHandler { //nolint:errorlint // sentinel compared as net/http does
+				s.d.Log.Error("panic in live log stream", "panic", v)
+			}
+			panic(http.ErrAbortHandler)
+		}
+	}()
 	ls := &logStream{s: s, w: w, rc: http.NewResponseController(w), r: r, run: run,
 		path: s.d.Engine.LogPath(run.ID), offset: startOffset(r), status: run.Status, t: s.timing}
 	defer ls.close()
@@ -132,8 +163,9 @@ type logStream struct {
 	pend   []byte // a partial rune or a trailing \r waits for the next read
 	trim   bool   // drop continuation bytes a resume offset landed inside
 	status model.Status
-	fixed  bool // the write deadline is fixed (shutdown); writes don't extend it
-	failed bool // a write failed: the client is gone
+	fixed  atomic.Int64 // unix nanos of the fixed shutdown deadline; 0 while writes extend it
+	failed bool         // a write failed: the client is gone
+	buf    []byte
 }
 
 func (ls *logStream) close() {
@@ -145,15 +177,29 @@ func (ls *logStream) close() {
 func (ls *logStream) serve() {
 	// The server's ReadTimeout would cancel the request at 30 s and its
 	// WriteTimeout would cut the stream at 70 s; each write sets its own.
-	_ = ls.rc.SetReadDeadline(time.Time{})
+	if err := ls.rc.SetReadDeadline(time.Time{}); err != nil {
+		ls.s.d.Log.Warn("live log: cannot clear the read deadline; the stream may be cut", "err", err)
+	}
 	h := ls.w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-store")
 	h.Set("X-Accel-Buffering", "no") // nginx: pass events through unbuffered
 	ls.w.WriteHeader(http.StatusOK)
 	ls.write([]byte("retry: " + strconv.Itoa(streamRetryMs) + "\n\n"))
 	ls.statusEvent()
 
 	stop := ls.s.d.Engine.Stopping()
+	// A write blocked on a reader that stopped reading would otherwise hold
+	// shutdown for WriteGrace; fixing the deadline now unblocks it.
+	quit := make(chan struct{})
+	defer close(quit)
+	go func() {
+		select {
+		case <-stop:
+			ls.fixDeadline()
+		case <-quit:
+		}
+	}()
 	select {
 	case <-stop:
 		ls.shutdown()
@@ -254,13 +300,25 @@ func (ls *logStream) finished() {
 }
 
 func (ls *logStream) shutdown() {
-	_ = ls.rc.SetWriteDeadline(time.Now().Add(ls.t.ShutdownGrace))
-	ls.fixed = true
+	ls.fixDeadline()
 	ls.end("shutdown", true)
+}
+
+// fixDeadline gives the rest of the stream ShutdownGrace in total.
+func (ls *logStream) fixDeadline() {
+	at := time.Now().Add(ls.t.ShutdownGrace)
+	if ls.fixed.CompareAndSwap(0, at.UnixNano()) {
+		_ = ls.rc.SetWriteDeadline(at)
+	}
 }
 
 // end sends the last event. drain first sends every remaining byte.
 func (ls *logStream) end(reason string, drain bool) {
+	// The rest of the log goes only to a caller still authorised now, not
+	// as of the last re-check (shutdown skips it: the store may be closing).
+	if drain && reason != "shutdown" && !ls.authorised() {
+		reason, drain = "unauthorized", false
+	}
 	if drain {
 		if err := ls.pump(true); err != nil {
 			reason = "error"
@@ -308,11 +366,25 @@ func (ls *logStream) pump(final bool) error {
 	if size < ls.offset {
 		return errTruncated
 	}
-	buf := make([]byte, 32<<10)
+	ls.skipBehind(size)
+	if ls.buf == nil {
+		ls.buf = make([]byte, 32<<10)
+	}
 	var read int64
-	for ls.offset < size && (final || read < streamTickBudget) {
-		n, err := ls.f.ReadAt(buf[:min(int64(len(buf)), size-ls.offset)], ls.offset)
-		ls.pend = append(ls.pend, buf[:n]...)
+	for ls.offset < size && !ls.failed {
+		if read >= streamTickBudget {
+			if !final {
+				break
+			}
+			// A drain goes on to EOF, but sends as it reads: memory stays at
+			// one budget per stream.
+			if err := ls.sendPend(false); err != nil {
+				return err
+			}
+			read = 0
+		}
+		n, err := ls.f.ReadAt(ls.buf[:min(int64(len(ls.buf)), size-ls.offset)], ls.offset)
+		ls.pend = append(ls.pend, ls.buf[:n]...)
 		ls.offset += int64(n)
 		read += int64(n)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -321,7 +393,13 @@ func (ls *logStream) pump(final bool) error {
 		if n == 0 {
 			break
 		}
+		ls.dropLeadingContinuation()
 	}
+	return ls.sendPend(final)
+}
+
+// dropLeadingContinuation drops bytes a resume offset landed inside a rune with.
+func (ls *logStream) dropLeadingContinuation() {
 	if ls.trim {
 		for len(ls.pend) > 0 && !utf8.RuneStart(ls.pend[0]) {
 			ls.pend = ls.pend[1:]
@@ -330,7 +408,6 @@ func (ls *logStream) pump(final bool) error {
 			ls.trim = false
 		}
 	}
-	return ls.sendPend(final)
 }
 
 // position applies the resume offset and the catch-up cap once the file exists.
@@ -339,14 +416,20 @@ func (ls *logStream) position() error {
 	if err != nil {
 		return err
 	}
-	size := st.Size()
-	ls.offset = min(ls.offset, size)
+	ls.offset = min(ls.offset, st.Size())
 	ls.trim = ls.offset > 0
-	if start := size - streamCatchUpCap; start > ls.offset {
-		ls.event("log", strconv.FormatInt(start, 10), fmt.Appendf(nil, "[%d bytes skipped]\n", start-ls.offset))
+	return nil
+}
+
+// skipBehind keeps a follower at most streamCatchUpCap behind the end of the
+// log, at connect and whenever a writer outpaces the tick budget.
+func (ls *logStream) skipBehind(size int64) {
+	sent := ls.offset - int64(len(ls.pend))
+	if start := size - streamCatchUpCap; start > sent {
+		ls.pend = ls.pend[:0]
+		ls.event("log", strconv.FormatInt(start, 10), fmt.Appendf(nil, "[%d bytes skipped]\n", start-sent))
 		ls.offset, ls.trim = start, true
 	}
-	return nil
 }
 
 func (ls *logStream) sendPend(final bool) error {
@@ -418,8 +501,12 @@ func (ls *logStream) write(p []byte) {
 	if ls.failed {
 		return
 	}
-	if !ls.fixed {
+	if ls.fixed.Load() == 0 {
 		_ = ls.rc.SetWriteDeadline(time.Now().Add(ls.t.WriteGrace))
+		// Shutdown may have fixed the deadline between the check and the set.
+		if at := ls.fixed.Load(); at != 0 {
+			_ = ls.rc.SetWriteDeadline(time.Unix(0, at))
+		}
 	}
 	if _, err := ls.w.Write(p); err != nil {
 		ls.failed = true
