@@ -90,7 +90,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		TrustedProxies: r.trustedProxies(),
 
 		MaxHTTPInflight:     r.int("MAX_HTTP_INFLIGHT", 64),
-		MaxHTTPPerClient:    r.int("MAX_HTTP_INFLIGHT_PER_CLIENT", 16),
+		MaxHTTPPerClient:    r.int("MAX_HTTP_INFLIGHT_PER_CLIENT", 4),
 		MaxPendingPerClient: r.int("MAX_PENDING_PER_CLIENT", 1000),
 		MaxContainers:       r.int("MAX_CONTAINERS", 4),
 		PullTimeoutSec:      r.int("PULL_TIMEOUT_SEC", 300),

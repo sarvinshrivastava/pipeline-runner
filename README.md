@@ -99,7 +99,7 @@ Real values come from the secrets manager under the `PIPELINE_RUNNER_` prefix; `
 | `NTFY_BASE`, `NTFY_TOPIC_OK`, `NTFY_TOPIC_FAIL`, `NTFY_TOKEN` | | `https://ntfy.sh` | pages |
 | `HEARTBEAT_URL` | | | Uptime Kuma push URL, pinged every 60 s while the engine is healthy |
 | `MAX_HTTP_INFLIGHT` | | 64 | global HTTP callback slots |
-| `MAX_HTTP_INFLIGHT_PER_CLIENT` | | 16 | per-client share of those slots (0 = no cap; logged as a warning) |
+| `MAX_HTTP_INFLIGHT_PER_CLIENT` | | 4 | per-client share of those slots (0 = no cap; logged as a warning) |
 | `MAX_PENDING_PER_CLIENT` | | 1000 | invoke and ad hoc runs (with their retries and defers) a client may have pending, running or waiting before further requests get `429 pending_limit` (0 = no limit) |
 | `RUN_RETENTION_DAYS` | | 60 | run history kept; sub-minute jobs keep 7 days |
 

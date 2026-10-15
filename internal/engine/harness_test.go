@@ -248,7 +248,11 @@ func (h *harness) runs(jobID string) []model.Run {
 
 func (h *harness) waitFor(desc string, cond func() bool) {
 	h.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	wait := 5 * time.Second
+	if raceEnabled {
+		wait = 20 * time.Second // the full -race suite runs packages in parallel
+	}
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		h.sync()
 		if cond() {
@@ -256,7 +260,7 @@ func (h *harness) waitFor(desc string, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	h.t.Fatalf("timed out waiting for %s", desc)
+	h.t.Fatalf("timed out waiting for %s (pages so far: %v)", desc, h.pager.titles())
 }
 
 func (h *harness) waitStatus(id string, want model.Status) model.Run {

@@ -24,7 +24,7 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Port != 3000 || c.MetricsPort != 9464 || c.MaxHTTPInflight != 64 || c.MaxHTTPPerClient != 16 || c.MaxPendingPerClient != 1000 || c.MaxContainers != 4 {
+	if c.Port != 3000 || c.MetricsPort != 9464 || c.MaxHTTPInflight != 64 || c.MaxHTTPPerClient != 4 || c.MaxPendingPerClient != 1000 || c.MaxContainers != 4 {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	if c.EnableContainerTargets {
