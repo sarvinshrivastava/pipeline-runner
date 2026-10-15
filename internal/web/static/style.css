@@ -162,5 +162,9 @@ nav.tabs .btn[aria-selected="true"] { border-color: var(--accent); color: var(--
 .json-input { min-height: 200px; }
 .json-input-tall { min-height: 280px; }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-.row-actions select { width: auto; flex: 1 1 10rem; min-width: 0; }
+/* Chrome sizes a wrapping flex container to its widest item, so a wrapping
+   filter row in the card head always stacks; keep it on one line and let the
+   selects shrink instead. */
+.card-head .row-actions { flex-wrap: nowrap; min-width: 0; }
+.row-actions select { width: auto; flex: 0 1 12rem; min-width: 0; }
 .token-once { word-break: break-all; }
