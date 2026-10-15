@@ -215,6 +215,9 @@ func (e *Engine) finalize(r model.Run, from []model.Status, o outcome) bool {
 
 // afterFinalize runs once a terminal write has committed.
 func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, from []model.Status) {
+	if o.status == model.StatusMissed && r.JobID != "" {
+		e.pageCountFor(r.JobID).missed++
+	}
 	e.release(r.ID)
 	e.stopLease(r.ID)
 	delete(e.cancelFns, r.ID)

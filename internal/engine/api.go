@@ -461,13 +461,14 @@ func (e *Engine) Adhoc(ctx context.Context, owner model.Principal, in model.Adho
 }
 
 // checkPendingLimit refuses a new on-demand run once the client has
-// MaxPendingPerClient runs queued, which bounds the wait lists one client
-// can make the loop scan.
+// MaxPendingPerClient non-schedule runs in flight (their retries and defers
+// included). With the job limit (one pending schedule run per job) it bounds
+// the wait lists one client can make the loop scan.
 func (e *Engine) checkPendingLimit(ctx context.Context, q store.Querier, clientID string) error {
 	if e.d.MaxPendingPerClient <= 0 {
 		return nil
 	}
-	n, err := store.CountPendingForClient(ctx, q, clientID)
+	n, err := store.CountInFlightOnDemand(ctx, q, clientID)
 	if err != nil {
 		return err
 	}

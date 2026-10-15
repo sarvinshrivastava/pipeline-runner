@@ -45,7 +45,7 @@ type Config struct {
 	MaxHTTPInflight int
 	// MaxHTTPPerClient bounds one client's share of the HTTP slots; 0 is no cap.
 	MaxHTTPPerClient int
-	// MaxPendingPerClient bounds one client's queued on-demand runs; 0 is no bound.
+	// MaxPendingPerClient bounds one client's on-demand runs in flight; 0 is no bound.
 	MaxPendingPerClient int
 	MaxContainers       int
 	PullTimeoutSec      int

@@ -423,7 +423,7 @@ func TestDeleteJobDropsCappedRunMeta(t *testing.T) {
 	}
 }
 
-// A backdated due time ranks no earlier than one full aging span ago.
+// A backdated due time ranks from when the run started waiting.
 func TestBackdatedRunCannotJumpAging(t *testing.T) {
 	h := newHarness(t, withMaxHTTP(1))
 	g := newRunGates(h)
@@ -453,17 +453,31 @@ func TestPendingLimitRefusesInvoke(t *testing.T) {
 	newRunGates(h)
 	h.e.d.MaxPendingPerClient = 3
 	j := h.create(invokeJob("f", nil))
-	invoke(t, h, j.ID) // runs
+	invoke(t, h, j.ID) // runs: in flight counts too
 	h.sync()
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		invoke(t, h, j.ID) // pending
 	}
 	if _, err := h.e.Invoke(context.Background(), j.ID, nil, nil, nil); !errors.Is(err, ErrPendingLimit) {
-		t.Fatalf("4th pending invoke: %v, want ErrPendingLimit", err)
+		t.Fatalf("4th invoke in flight: %v, want ErrPendingLimit", err)
 	}
 	other := h.addClient("other")
 	spec := model.AdhocReq{Client: "other", Target: httpTarget()}
 	if _, err := h.e.Adhoc(context.Background(), other, spec, nil); err != nil {
 		t.Fatalf("another client must not be limited: %v", err)
+	}
+}
+
+// Retries of failing on-demand runs count against the limit.
+func TestPendingLimitCountsRetries(t *testing.T) {
+	h := newHarness(t, withMaxHTTP(4))
+	h.e.d.MaxPendingPerClient = 2
+	h.exec.set(failAmbiguous)
+	j := h.create(invokeJob("f", &model.PolicyIn{Retry: &model.RetryIn{MaxAttempts: ptr(10), BackoffSec: ptr(int64(3600))}}))
+	invoke(t, h, j.ID)
+	invoke(t, h, j.ID)
+	waitCount(h, 2, model.StatusFailed)
+	if _, err := h.e.Invoke(context.Background(), j.ID, nil, nil, nil); !errors.Is(err, ErrPendingLimit) {
+		t.Fatalf("invoke with 2 retries pending: %v, want ErrPendingLimit", err)
 	}
 }

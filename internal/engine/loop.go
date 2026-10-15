@@ -402,13 +402,11 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 	late := now.Sub(r.LatenessRef)
 	if late > time.Duration(spec.Policy.MaxLateSec)*time.Second {
 		lateMs := late.Milliseconds()
-		won := e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusMissed, lateMs: &lateMs,
+		// afterFinalize counts it for the page once the missed status is saved
+		// (now, or when a result held through a DB outage flushes); a stale
+		// row's lost finalize missed nothing.
+		e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusMissed, lateMs: &lateMs,
 			err: fmt.Sprintf("not dispatched within max_late_sec (%ds)", spec.Policy.MaxLateSec)})
-		// A stale row's lost finalize missed nothing; a result held through a
-		// DB outage still missed.
-		if (won || e.isUnflushed(r.ID)) && r.JobID != "" {
-			e.pageCountFor(r.JobID).missed++
-		}
 		return
 	}
 
@@ -632,6 +630,7 @@ func (e *Engine) wake(list string) {
 	now := e.now()
 	pool, isPool := strings.CutPrefix(list, "pool:")
 	capScan := isPool && pool == poolHTTP && e.d.MaxHTTPPerClient > 0
+	readFailed := false // after one failed read, only cached rows are tried
 	for i := 0; ; {
 		if isPool && e.inflight[pool] >= e.poolCap(pool) {
 			return
@@ -645,6 +644,10 @@ func (e *Engine) wake(list string) {
 			i++
 			continue
 		}
+		if _, cached := e.rows[id]; readFailed && !cached {
+			i++
+			continue
+		}
 		r, err := e.pendingRow(e.life, id)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			// Transient: unparking would orphan the run (its late-deadline
@@ -655,6 +658,7 @@ func (e *Engine) wake(list string) {
 			if !isPool {
 				return
 			}
+			readFailed = true
 			i++
 			continue
 		}

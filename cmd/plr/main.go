@@ -111,6 +111,9 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 		log.Warn("per-client HTTP cap is off: one client can hold every HTTP slot",
 			"MAX_HTTP_INFLIGHT_PER_CLIENT", cfg.MaxHTTPPerClient, "MAX_HTTP_INFLIGHT", cfg.MaxHTTPInflight)
 	}
+	if cfg.MaxPendingPerClient == 0 {
+		log.Warn("per-client run limit is off: one client can queue unbounded runs", "MAX_PENDING_PER_CLIENT", 0)
+	}
 	st, err := store.Open(ctx, filepath.Join(cfg.DataDir, "v2", "plr.db"))
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)

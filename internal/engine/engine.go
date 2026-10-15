@@ -83,8 +83,8 @@ type Deps struct {
 	EnvKey           []byte
 	MaxHTTPInflight  int
 	MaxHTTPPerClient int // one client's share of MaxHTTPInflight; 0 is no cap
-	// MaxPendingPerClient bounds the pending runs a client may queue through
-	// invoke and ad hoc requests; 0 is no bound.
+	// MaxPendingPerClient bounds a client's non-schedule runs in flight
+	// (pending, running or waiting); 0 is no bound.
 	MaxPendingPerClient int
 	MaxContainers       int
 	DataDir             string
