@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -321,10 +323,16 @@ func (e *Engine) blocker(r model.Run, spec model.RunSpec) (list string, skip boo
 		return "key:" + ns, false
 	}
 	pool := poolOf(spec.Target.Type)
-	if e.inflight[pool] >= e.poolCap(pool) {
+	if e.inflight[pool] >= e.poolCap(pool) || e.clientCapped(pool, r.ClientID) {
+		// A capped run waits on the pool list too, keeping its rank there.
 		return "pool:" + pool, false
 	}
 	return "", false
+}
+
+// clientCapped reports that client already holds its share of the pool.
+func (e *Engine) clientCapped(pool, client string) bool {
+	return pool == poolHTTP && e.d.MaxHTTPPerClient > 0 && e.clientBusy[client] >= e.d.MaxHTTPPerClient
 }
 
 // keyLimit is the minimum limit across the client's jobs using the key.
@@ -430,6 +438,9 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 	r.Status, r.StartedAt, r.LateMs, r.DeadlineAt = model.StatusRunning, &now, &lateMs, &deadline
 
 	h := held{jobID: r.JobID, ns: nsKeyOf(r, spec), pool: poolOf(spec.Target.Type), run: r}
+	if h.pool == poolHTTP {
+		h.client = r.ClientID
+	}
 	e.reserve(r.ID, h)
 
 	jobLabel := r.JobName
@@ -460,6 +471,9 @@ func (e *Engine) reserve(runID string, h held) {
 	if h.pool != "" {
 		e.inflight[h.pool]++
 	}
+	if h.client != "" {
+		e.clientBusy[h.client]++
+	}
 }
 
 // release frees what a run holds. Without a held entry it is a no-op.
@@ -483,6 +497,7 @@ func (e *Engine) release(runID string) {
 	dec(e.jobBusy, h.jobID)
 	dec(e.keyBusy, h.ns)
 	dec(e.inflight, h.pool)
+	dec(e.clientBusy, h.client)
 	e.wakeFor(h)
 }
 
@@ -492,11 +507,16 @@ func (e *Engine) releasePool(runID string) {
 	if !ok || h.pool == "" {
 		return
 	}
-	pool := h.pool
-	h.pool = ""
+	pool, client := h.pool, h.client
+	h.pool, h.client = "", ""
 	e.held[runID] = h
 	if e.inflight[pool]--; e.inflight[pool] <= 0 {
 		delete(e.inflight, pool)
+	}
+	if client != "" {
+		if e.clientBusy[client]--; e.clientBusy[client] <= 0 {
+			delete(e.clientBusy, client)
+		}
 	}
 	e.wake("pool:" + pool)
 }
@@ -513,20 +533,73 @@ func (e *Engine) wakeFor(h held) {
 	}
 }
 
+// parkMeta is what a parked run is ranked by, kept so a wait-list scan can
+// order and skip runs without loading them.
+type parkMeta struct {
+	latRef int64 // LatenessRef, unix ms
+	offset int64 // priority offset, ms
+	seq    uint64
+	client string
+	http   bool
+}
+
+// rankFor orders a list: a job's own queue stays FIFO by due time; key and
+// pool lists add the priority offset, so a waiting run ages past fresh
+// higher-priority arrivals.
+func rankFor(list string, m parkMeta) int64 {
+	if strings.HasPrefix(list, "job:") {
+		return m.latRef
+	}
+	return m.latRef + m.offset
+}
+
 func (e *Engine) park(r model.Run, spec model.RunSpec, list string) {
 	if _, already := e.parked[r.ID]; already {
 		return
 	}
-	e.parked[r.ID] = list
-	e.waits[list] = append(e.waits[list], r.ID)
+	e.parkSeq++
+	m := parkMeta{
+		latRef: r.LatenessRef.UnixMilli(), offset: model.PriorityOffset(spec.Policy.Priority).Milliseconds(),
+		seq: e.parkSeq, client: r.ClientID, http: spec.Target.Type == model.TargetHTTP,
+	}
+	e.meta[r.ID] = m
+	e.insert(r.ID, list, m)
 	e.cacheRow(r) // a parked run is due: its admission reads nothing
 	e.heap.push(entry{runID: r.ID, at: r.LatenessRef.Add(time.Duration(spec.Policy.MaxLateSec)*time.Second + time.Millisecond), kind: entryLateDeadline})
 }
 
+// insert places a run in list by (rank, seq).
+func (e *Engine) insert(runID, list string, m parkMeta) {
+	e.parked[runID] = list
+	ids := e.waits[list]
+	rank := rankFor(list, m)
+	i := sort.Search(len(ids), func(i int) bool {
+		o := e.meta[ids[i]]
+		ro := rankFor(list, o)
+		return ro > rank || (ro == rank && o.seq > m.seq)
+	})
+	e.waits[list] = slices.Insert(ids, i, runID)
+}
+
+// move re-lists a parked run. It keeps its rank inputs and pushes no heap
+// entry: the run's late-deadline entry still finds it parked.
+func (e *Engine) move(runID, list string) {
+	m := e.meta[runID]
+	e.detach(runID)
+	e.insert(runID, list, m)
+}
+
 func (e *Engine) unpark(runID string) {
+	if e.detach(runID) {
+		delete(e.meta, runID)
+	}
+}
+
+// detach removes a run from its wait list, keeping its meta.
+func (e *Engine) detach(runID string) bool {
 	list, ok := e.parked[runID]
 	if !ok {
-		return
+		return false
 	}
 	delete(e.parked, runID)
 	ids := e.waits[list]
@@ -539,50 +612,60 @@ func (e *Engine) unpark(runID string) {
 	if len(e.waits[list]) == 0 {
 		delete(e.waits, list)
 	}
+	return true
 }
 
-// wake admits runs from the head of a wait list while they can run. Ghost
-// heads are popped in a loop so they never use up a wake.
+// wake admits runs from a wait list, best rank first, while they can run.
+// On the HTTP pool list it steps over runs whose client holds its full
+// share (from their meta, with no I/O); they keep their place. Ghosts are
+// dropped in the loop so they never use up a wake.
 func (e *Engine) wake(list string) {
 	if e.draining {
 		return // no new dispatch during shutdown; boot recovery takes them
 	}
 	now := e.now()
-	for {
-		ids := e.waits[list]
-		if len(ids) == 0 {
-			delete(e.waits, list)
+	pool, isPool := strings.CutPrefix(list, "pool:")
+	capScan := isPool && pool == poolHTTP && e.d.MaxHTTPPerClient > 0
+	for i := 0; ; {
+		if isPool && e.inflight[pool] >= e.poolCap(pool) {
 			return
 		}
-		head := ids[0]
-		r, err := e.pendingRow(e.life, head)
+		ids := e.waits[list] // re-read: unpark and move rewrite it in place
+		if i >= len(ids) {
+			return
+		}
+		id := ids[i]
+		if m := e.meta[id]; capScan && m.http && e.clientBusy[m.client] >= e.d.MaxHTTPPerClient {
+			i++
+			continue
+		}
+		r, err := e.pendingRow(e.life, id)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			// Transient: unparking would orphan the run (its late-deadline
 			// entry is skipped once it leaves the list). It keeps its place;
 			// the next release or reconcile wakes the list again.
-			e.log.Error("load parked run; leaving it parked", "run", head, "err", err)
+			e.log.Error("load parked run; leaving it parked", "run", id, "err", err)
 			return
 		}
 		if err != nil || r.Status != model.StatusPending {
-			e.unpark(head)
+			e.unpark(id)
 			continue
 		}
 		spec, err := e.spec(r)
 		if err != nil {
-			e.unpark(head)
-			e.dispatch(head, now) // fails it with a clear error
+			e.unpark(id)
+			e.dispatch(id, now) // fails it with a clear error
 			continue
 		}
 		if blockedBy, skip := e.blocker(r, spec); blockedBy != "" && !skip {
 			if blockedBy != list {
-				e.unpark(head)
-				e.park(r, spec, blockedBy)
+				e.move(id, blockedBy)
 				continue
 			}
 			return
 		}
-		e.unpark(head)
-		e.dispatch(head, now)
+		e.unpark(id)
+		e.dispatch(id, now)
 	}
 }
 

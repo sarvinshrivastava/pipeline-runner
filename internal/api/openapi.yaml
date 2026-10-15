@@ -96,10 +96,15 @@ components:
             backoff_sec: {type: integer, default: 30}
             max_backoff_sec: {type: integer, default: 3600}
         concurrency_key: {type: string}
-        concurrency_limit: {type: integer}
+        concurrency_limit: {type: integer, description: "For http targets also bounded by the runner's per-client slot cap (MAX_HTTP_INFLIGHT_PER_CLIENT, default 16)."}
         overlap: {type: string, enum: [skip, queue, allow]}
         max_defer_sec: {type: integer, default: 86400}
         notify_on_success: {type: boolean}
+        priority:
+          type: string
+          enum: [high, normal, low]
+          default: normal
+          description: Orders runs waiting for a slot. A waiting run gains one level every 30 s, so low never starves.
     HTTPTarget:
       type: object
       required: [url]

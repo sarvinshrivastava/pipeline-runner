@@ -197,10 +197,14 @@ func (e *Engine) rebuildHeld(ctx context.Context) error {
 		if r.Status == model.StatusRunning {
 			h.pool = poolOf(spec.Target.Type)
 			h.run = r
+			if h.pool == poolHTTP {
+				h.client = r.ClientID
+			}
 		}
 		next[r.ID] = h
 	}
 	e.held, e.jobBusy, e.keyBusy, e.inflight = map[string]held{}, map[string]int{}, map[string]int{}, map[string]int{}
+	e.clientBusy = map[string]int{}
 	for id, h := range next {
 		e.reserve(id, h)
 	}
@@ -321,12 +325,12 @@ func (e *Engine) reconcile(now time.Time) {
 	}
 	e.ensureAllMaterialised(pending)
 
-	before := fmt.Sprint(len(e.held), e.inflight, e.keyBusy, e.jobBusy)
+	before := fmt.Sprint(len(e.held), e.inflight, e.keyBusy, e.jobBusy, e.clientBusy)
 	if err := e.rebuildHeld(ctx); err != nil {
 		e.log.Error("reconcile: rebuild held", "err", err)
 		return
 	}
-	if after := fmt.Sprint(len(e.held), e.inflight, e.keyBusy, e.jobBusy); after != before {
+	if after := fmt.Sprint(len(e.held), e.inflight, e.keyBusy, e.jobBusy, e.clientBusy); after != before {
 		e.log.Warn("reconcile: gate counts drifted; repaired", "before", before, "after", after)
 	}
 	for list := range e.waits {

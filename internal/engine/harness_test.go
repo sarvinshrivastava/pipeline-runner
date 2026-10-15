@@ -94,6 +94,13 @@ func (f *fakeExec) set(fn func(ctx context.Context, in target.ExecInput) target.
 	f.mu.Unlock()
 }
 
+// snapshot copies the calls so far; exec goroutines append concurrently.
+func (f *fakeExec) snapshot() []target.ExecInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]target.ExecInput(nil), f.calls...)
+}
+
 func (f *fakeExec) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -110,12 +117,15 @@ type harness struct {
 	owner   model.Principal
 	dir     string
 	maxHTTP int
+	perClient int // 0: no per-client cap, so existing tests run uncapped
 	metrics *metrics.Metrics
 }
 
 type opt func(*harness)
 
 func withMaxHTTP(n int) opt { return func(h *harness) { h.maxHTTP = n } }
+
+func withPerClient(n int) opt { return func(h *harness) { h.perClient = n } }
 
 func withMetrics() opt {
 	return func(h *harness) { h.metrics = metrics.New(func() float64 { return 0 }) }
@@ -154,7 +164,7 @@ func (h *harness) start() {
 	h.e = New(Deps{
 		Store: h.st, Clock: h.clk, Executors: map[string]target.Executor{model.TargetHTTP: h.exec},
 		Secrets: fakeSecrets{}, Pager: h.pager, Metrics: h.metrics, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		RunTokenKey: []byte("run-key"), EnvKey: bytes.Repeat([]byte{1}, 32), MaxHTTPInflight: h.maxHTTP, MaxContainers: 4,
+		RunTokenKey: []byte("run-key"), EnvKey: bytes.Repeat([]byte{1}, 32), MaxHTTPInflight: h.maxHTTP, MaxHTTPPerClient: h.perClient, MaxContainers: 4,
 		DataDir: h.dir, RetentionDays: 60, Rand: func(int64) int64 { return 0 },
 	})
 	if err := h.e.Start(context.Background()); err != nil {

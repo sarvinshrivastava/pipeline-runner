@@ -88,6 +88,29 @@ const (
 	OverlapAllow = "allow"
 )
 
+// Priorities order runs waiting for the same slot. A waiting run gains one
+// level per PriorityAgingStep, so a lower priority never starves.
+const (
+	PriorityHigh   = "high"
+	PriorityNormal = "normal"
+	PriorityLow    = "low"
+
+	PriorityAgingStep = 30 * time.Second
+)
+
+// PriorityOffset is how much later than its due time a run of priority p
+// ranks among waiters: one aging step per level below high.
+func PriorityOffset(p string) time.Duration {
+	switch p {
+	case PriorityHigh:
+		return 0
+	case PriorityLow:
+		return 2 * PriorityAgingStep
+	default:
+		return PriorityAgingStep
+	}
+}
+
 // AdhocJobName labels runs that belong to no job.
 const AdhocJobName = "_adhoc"
 
@@ -119,6 +142,22 @@ type Policy struct {
 	Overlap          string      `json:"overlap"` // skip|queue|allow
 	MaxDeferSec      int64       `json:"max_defer_sec"`
 	NotifyOnSuccess  bool        `json:"notify_on_success"`
+	Priority         string      `json:"priority"`
+}
+
+type policyAlias Policy
+
+// UnmarshalJSON reads policies stored before priority existed as normal.
+func (p *Policy) UnmarshalJSON(b []byte) error {
+	var a policyAlias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	if a.Priority == "" {
+		a.Priority = PriorityNormal
+	}
+	*p = Policy(a)
+	return nil
 }
 
 // HTTPAuth names vault references; values are resolved at fire time.

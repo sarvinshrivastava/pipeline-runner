@@ -24,7 +24,7 @@ func TestCronFiresAndMaterialisesNext(t *testing.T) {
 	if len(rs) != 2 || rs[1].Status != model.StatusPending || !rs[1].ScheduledFor.Equal(t0.Add(2*time.Minute)) {
 		t.Fatalf("next occurrence not materialised: %+v", rs)
 	}
-	in := h.exec.calls[0]
+	in := h.exec.snapshot()[0]
 	if in.RunToken == "" || in.Run.ID != rs[0].ID {
 		t.Fatalf("exec input: %+v", in)
 	}
@@ -47,7 +47,7 @@ func TestMissedPastWindowPagesOnce(t *testing.T) {
 	if last.NominalFor.Before(t0.Add(time.Hour)) {
 		t.Fatalf("the outage must collapse to the current occurrence: %+v", last)
 	}
-	for _, c := range h.exec.calls {
+	for _, c := range h.exec.snapshot() {
 		if c.Run.ID == first.ID {
 			t.Fatal("a missed run must never execute late")
 		}

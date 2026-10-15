@@ -56,7 +56,7 @@ func New(loopAge func() float64) *Metrics {
 		}, []string{"job"}),
 		PendingRuns:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "plr_pending_runs", Help: "Pending runs known to the engine."}),
 		Inflight:        prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "plr_inflight", Help: "Runs holding a pool slot."}, []string{"target"}),
-		QueueDepth:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "plr_queue_depth", Help: "Due runs parked waiting for a slot."}, []string{"target"}),
+		QueueDepth:      prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "plr_queue_depth", Help: "Due runs parked on the pool list, waiting for a slot or for their client's share of slots."}, []string{"target"}),
 		WaitingRuns:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "plr_waiting_runs", Help: "Async runs waiting for completion."}),
 		SkippedTotal:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "plr_skipped_total", Help: "Runs skipped by overlap=skip."}, []string{"job"}),
 		UnflushedWrites: prometheus.NewGauge(prometheus.GaugeOpts{Name: "plr_unflushed_writes", Help: "Terminal results held in memory after a DB write failure."}),

@@ -33,7 +33,12 @@ A single Go binary (`plr`) with SQLite and an embedded dashboard. Delivery 1a sh
 - **Concurrency:**
   - `overlap` is `skip`, `queue` or `allow` per job.
   - `concurrency_key` and `concurrency_limit` apply across a client's jobs.
-  - A global HTTP slot pool (`MAX_HTTP_INFLIGHT`) and a per-client cap (`MAX_HTTP_INFLIGHT_PER_CLIENT`) keep one client from starving the rest.
+  - A global HTTP slot pool (`MAX_HTTP_INFLIGHT`) and a per-client cap (`MAX_HTTP_INFLIGHT_PER_CLIENT`) keep one client from starving the rest. For HTTP jobs, a `concurrency_limit` above the cap is effectively the cap.
+- **Priority:**
+  - `policy.priority` is `high`, `normal` (the default) or `low`. It orders runs that are waiting for a slot.
+  - Every 30 s of waiting gains a run one level, so a `low` run is never starved.
+  - A job's own queue (`overlap: queue`) stays first in, first out.
+  - Limitation: runs due at the same instant start in arrival order while free slots remain.
 
 Every callback carries `X-PLR-Run-Id`, `X-PLR-Job`, `X-PLR-Trigger`, `X-PLR-Attempt` and `X-PLR-Scheduled-For`. When the job has an `hmac_ref`, it also carries `X-PLR-Signature`.
 
@@ -102,7 +107,7 @@ Real values come from the secrets manager under the `PIPELINE_RUNNER_` prefix; `
 - **Health:** `GET /healthz` returns 503 if the engine loop stalls for more than 60 s. The compose healthcheck runs `plr healthcheck`, and autoheal restarts the container.
 - **Metrics:** Prometheus on `:9464`, internal networks only. Key series:
   - `plr_fire_delay_seconds`, `plr_runs_total{status}` and `plr_pending_runs`;
-  - `plr_queue_depth`, `plr_inflight` and `plr_coalesced_occurrences_total`.
+  - `plr_queue_depth`, `plr_inflight` and `plr_coalesced_occurrences_total`. `plr_queue_depth{target="http"}` also counts runs waiting for their client's share; if `plr_inflight` is below `MAX_HTTP_INFLIGHT` at the same time, a client is at its cap.
 - **Shutdown:** in-flight callbacks get a 20 s drain. Boot recovery then re-dispatches `at_least_once` runs inside their window and interrupts the rest.
 - **Capacity:** a 1-CPU, 512 MB container sustained 800 req/s of mixed API load with 100 every-second cron jobs in load tests (2026-10-14). Expected production load is about 5 req/s.
 

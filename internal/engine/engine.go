@@ -81,6 +81,7 @@ type Deps struct {
 	RunTokenKey       []byte
 	EnvKey            []byte
 	MaxHTTPInflight   int
+	MaxHTTPPerClient  int // one client's share of MaxHTTPInflight; 0 is no cap
 	MaxContainers     int
 	DataDir           string
 	RetentionDays     int
@@ -96,6 +97,9 @@ type held struct {
 	jobID string
 	ns    string
 	pool  string
+	// client is set only together with pool == poolHTTP: only an HTTP slot
+	// counts against the client's share.
+	client string
 	// run is the row as claimed, authoritative only while run.Status is
 	// running (the loop is the only writer of running rows). It is zero for
 	// waiting runs and for entries rebuilt without a row.
@@ -156,7 +160,10 @@ type Engine struct {
 	// pending. A stale row only loses its guarded claim.
 	rows            map[string]model.Run
 	parked          map[string]string   // runID → wait list name
-	waits           map[string][]string // wait list name → FIFO of run ids
+	waits           map[string][]string // wait list name → run ids by (rank, seq)
+	meta            map[string]parkMeta // runID → its rank inputs; same keys as parked
+	parkSeq         uint64
+	clientBusy      map[string]int // client → HTTP slots held
 	held            map[string]held
 	jobBusy         map[string]int
 	keyBusy         map[string]int
@@ -198,6 +205,7 @@ func New(d Deps) *Engine {
 		d: d, st: d.Store, log: d.Log,
 		events: make(chan event, 1024), life: life, stopLife: stop, done: make(chan struct{}), stopping: make(chan struct{}),
 		inHeap: map[string]int{}, rows: map[string]model.Run{}, parked: map[string]string{}, waits: map[string][]string{},
+		meta: map[string]parkMeta{}, clientBusy: map[string]int{},
 		held: map[string]held{}, jobBusy: map[string]int{}, keyBusy: map[string]int{}, inflight: map[string]int{},
 		jobs: map[string]*jobEntry{}, revs: map[revKey]model.RunSpec{}, awaiters: map[string][]chan model.Run{},
 		leaseGen: map[string]uint64{}, leaseTimers: map[string]Timer{}, cancelFns: map[string]context.CancelFunc{},

@@ -55,6 +55,7 @@ type PolicyIn struct {
 	Overlap          *string  `json:"overlap,omitempty"`
 	MaxDeferSec      *int64   `json:"max_defer_sec,omitempty"`
 	NotifyOnSuccess  *bool    `json:"notify_on_success,omitempty"`
+	Priority         *string  `json:"priority,omitempty"`
 }
 
 // HTTPIn is an HTTP target as sent.
@@ -347,7 +348,7 @@ func DefaultPolicy(trigType string, t Target) Policy {
 	return Policy{
 		TimeoutSec: 900, MaxLateSec: 600, LateWarnSec: 60, Delivery: AtLeastOnce,
 		Retry:   RetryPolicy{MaxAttempts: 1, BackoffSec: 30, MaxBackoffSec: 3600},
-		Overlap: overlap, MaxDeferSec: 86400,
+		Overlap: overlap, MaxDeferSec: 86400, Priority: PriorityNormal,
 	}
 }
 
@@ -434,6 +435,14 @@ func validatePolicy(in *PolicyIn, trigType string, t Target) (Policy, error) {
 	if in.NotifyOnSuccess != nil {
 		p.NotifyOnSuccess = *in.NotifyOnSuccess
 	}
+	if in.Priority != nil {
+		switch *in.Priority {
+		case PriorityHigh, PriorityNormal, PriorityLow:
+			p.Priority = *in.Priority
+		default:
+			return Policy{}, fieldErr("policy.priority", "invalid", "must be high, normal or low")
+		}
+	}
 	return p, nil
 }
 
@@ -446,6 +455,9 @@ func policyAsInput(p Policy) *PolicyIn {
 	}
 	if p.ConcurrencyKey != "" {
 		in.ConcurrencyKey, in.ConcurrencyLimit = &p.ConcurrencyKey, &p.ConcurrencyLimit
+	}
+	if p.Priority != "" {
+		in.Priority = &p.Priority
 	}
 	return in
 }

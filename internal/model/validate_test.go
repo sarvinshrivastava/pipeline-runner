@@ -333,3 +333,59 @@ func TestAdhocAppliesClientLimits(t *testing.T) {
 }
 
 func mustErr[T any](_ T, err error) error { return err }
+
+func TestPriorityDefaultsAndValidation(t *testing.T) {
+	j, err := ValidateJobCreate(httpJob(), ctx())
+	if err != nil || j.Policy.Priority != PriorityNormal {
+		t.Fatalf("default priority = %q, err %v", j.Policy.Priority, err)
+	}
+	in := httpJob()
+	in.Policy = &PolicyIn{Priority: ptr("urgent")}
+	if _, err := ValidateJobCreate(in, ctx()); code(t, err) != "invalid" {
+		t.Fatalf("invalid priority accepted: %v", err)
+	}
+	in.Policy = &PolicyIn{Priority: ptr(PriorityHigh)}
+	j, err = ValidateJobCreate(in, ctx())
+	if err != nil || j.Policy.Priority != PriorityHigh {
+		t.Fatalf("priority = %q, err %v", j.Policy.Priority, err)
+	}
+	// A target patch keeps the stored priority; a policy patch replaces it.
+	next, _, err := ValidatePatch(j, JobPatch{Target: ptr(httpJob().Target)}, ctx())
+	if err != nil || next.Policy.Priority != PriorityHigh {
+		t.Fatalf("target patch: priority %q, err %v", next.Policy.Priority, err)
+	}
+	next, _, err = ValidatePatch(j, JobPatch{Policy: &PolicyIn{TimeoutSec: ptr(int64(30))}}, ctx())
+	if err != nil || next.Policy.Priority != PriorityNormal {
+		t.Fatalf("policy patch: priority %q, err %v", next.Policy.Priority, err)
+	}
+}
+
+// Policies stored before priority existed have no "priority" key.
+func TestLegacyPolicyReadsAsNormalAndPatches(t *testing.T) {
+	cur, err := ValidateJobCreate(httpJob(), ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(cur.Policy)
+	legacy := strings.Replace(string(b), `,"priority":"normal"`, "", 1)
+	if strings.Contains(legacy, "priority") {
+		t.Fatalf("setup: %s", legacy)
+	}
+	var p Policy
+	if err := json.Unmarshal([]byte(legacy), &p); err != nil || p.Priority != PriorityNormal || p.TimeoutSec != 900 {
+		t.Fatalf("decoded %+v, err %v", p, err)
+	}
+	var spec RunSpec
+	if err := json.Unmarshal([]byte(`{"target":{"type":"http"},"policy":`+legacy+`}`), &spec); err != nil || spec.Policy.Priority != PriorityNormal {
+		t.Fatalf("RunSpec policy priority %q, err %v", spec.Policy.Priority, err)
+	}
+	// A Policy built without the field (as an older binary wrote it).
+	cur.Policy.Priority = ""
+	tz := TriggerIn{Type: TriggerCron, Cron: cur.Trigger.Cron, Timezone: "UTC"}
+	name := "renamed"
+	for _, patch := range []JobPatch{{Target: ptr(httpJob().Target)}, {Trigger: &tz}, {Name: &name}} {
+		if _, _, err := ValidatePatch(cur, patch, ctx()); err != nil {
+			t.Fatalf("legacy patch %+v: %v", patch, err)
+		}
+	}
+}

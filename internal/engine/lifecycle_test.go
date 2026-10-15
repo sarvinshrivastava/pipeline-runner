@@ -463,7 +463,7 @@ func TestRecovery(t *testing.T) {
 	h.start()
 
 	h.waitStatus(rALO.ID, model.StatusSuccess) // redispatched with the same id
-	if h.exec.calls[len(h.exec.calls)-1].Run.ID != rALO.ID && !calledWith(h, rALO.ID) {
+	if calls := h.exec.snapshot(); calls[len(calls)-1].Run.ID != rALO.ID && !calledWith(h, rALO.ID) {
 		t.Fatal("at_least_once run must be re-sent with the same run id")
 	}
 	if h.run(rAMO.ID).Status != model.StatusInterrupted || h.pager.count("interrupted") < 1 {
@@ -482,9 +482,7 @@ func TestRecovery(t *testing.T) {
 }
 
 func calledWith(h *harness, runID string) bool {
-	h.exec.mu.Lock()
-	defer h.exec.mu.Unlock()
-	for _, c := range h.exec.calls {
+	for _, c := range h.exec.snapshot() {
 		if c.Run.ID == runID {
 			return true
 		}

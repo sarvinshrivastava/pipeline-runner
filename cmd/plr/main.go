@@ -132,6 +132,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	eng = engine.New(engine.Deps{
 		Store: st, Executors: executors, Secrets: vc, Pager: pager, Metrics: m, Log: log,
 		RunTokenKey: cfg.RunTokenKey, EnvKey: cfg.EncryptionKey, MaxHTTPInflight: cfg.MaxHTTPInflight,
+		MaxHTTPPerClient: cfg.MaxHTTPPerClient,
 		MaxContainers: cfg.MaxContainers, DataDir: cfg.DataDir, RetentionDays: cfg.RunRetentionDays,
 		ContainersEnabled: false, // container/inline targets arrive in delivery 1b
 		CallbackPolicy:    callbackPolicy,

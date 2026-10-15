@@ -24,7 +24,7 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Port != 3000 || c.MetricsPort != 9464 || c.MaxHTTPInflight != 64 || c.MaxContainers != 4 {
+	if c.Port != 3000 || c.MetricsPort != 9464 || c.MaxHTTPInflight != 64 || c.MaxHTTPPerClient != 16 || c.MaxContainers != 4 {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	if c.EnableContainerTargets {
@@ -50,20 +50,21 @@ func TestEmptyStringIsUnset(t *testing.T) {
 
 func TestLoadRejects(t *testing.T) {
 	cases := map[string]func(map[string]string){
-		"missing data dir":   func(e map[string]string) { delete(e, "DATA_DIR") },
-		"relative data dir":  func(e map[string]string) { e["DATA_DIR"] = "data" },
-		"short api token":    func(e map[string]string) { e["API_TOKEN"] = "short" },
-		"missing run key":    func(e map[string]string) { delete(e, "RUN_TOKEN_KEY") },
-		"short enc key":      func(e map[string]string) { e["ENCRYPTION_KEY"] = "abcd" },
-		"non-hex key":        func(e map[string]string) { e["RUN_TOKEN_KEY"] = strings.Repeat("zz", 32) },
-		"bad int":            func(e map[string]string) { e["PORT"] = "abc" },
-		"same ports":         func(e map[string]string) { e["METRICS_PORT"] = "3000" },
-		"bad proxy":          func(e map[string]string) { e["TRUSTED_PROXIES"] = "nope" },
-		"no proxy setting":   func(e map[string]string) { delete(e, "TRUSTED_PROXIES") },
-		"port too high":      func(e map[string]string) { e["PORT"] = "70000" },
-		"bad bool":           func(e map[string]string) { e["ENABLE_CONTAINER_TARGETS"] = "maybe" },
-		"zero pool":          func(e map[string]string) { e["MAX_HTTP_INFLIGHT"] = "0" },
-		"zero retention day": func(e map[string]string) { e["RUN_RETENTION_DAYS"] = "0" },
+		"missing data dir":    func(e map[string]string) { delete(e, "DATA_DIR") },
+		"relative data dir":   func(e map[string]string) { e["DATA_DIR"] = "data" },
+		"short api token":     func(e map[string]string) { e["API_TOKEN"] = "short" },
+		"missing run key":     func(e map[string]string) { delete(e, "RUN_TOKEN_KEY") },
+		"short enc key":       func(e map[string]string) { e["ENCRYPTION_KEY"] = "abcd" },
+		"non-hex key":         func(e map[string]string) { e["RUN_TOKEN_KEY"] = strings.Repeat("zz", 32) },
+		"bad int":             func(e map[string]string) { e["PORT"] = "abc" },
+		"same ports":          func(e map[string]string) { e["METRICS_PORT"] = "3000" },
+		"bad proxy":           func(e map[string]string) { e["TRUSTED_PROXIES"] = "nope" },
+		"no proxy setting":    func(e map[string]string) { delete(e, "TRUSTED_PROXIES") },
+		"port too high":       func(e map[string]string) { e["PORT"] = "70000" },
+		"bad bool":            func(e map[string]string) { e["ENABLE_CONTAINER_TARGETS"] = "maybe" },
+		"zero pool":           func(e map[string]string) { e["MAX_HTTP_INFLIGHT"] = "0" },
+		"zero retention day":  func(e map[string]string) { e["RUN_RETENTION_DAYS"] = "0" },
+		"negative client cap": func(e map[string]string) { e["MAX_HTTP_INFLIGHT_PER_CLIENT"] = "-1" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -97,5 +98,14 @@ func TestNtfyBareHost(t *testing.T) {
 	}
 	if c.NtfyBase != "https://ntfy.example.com" {
 		t.Fatalf("NtfyBase = %q", c.NtfyBase)
+	}
+}
+
+func TestClientCapZeroDisables(t *testing.T) {
+	env := validEnv()
+	env["MAX_HTTP_INFLIGHT_PER_CLIENT"] = "0"
+	c, err := load(env)
+	if err != nil || c.MaxHTTPPerClient != 0 {
+		t.Fatalf("cap %d, err %v", c.MaxHTTPPerClient, err)
 	}
 }
