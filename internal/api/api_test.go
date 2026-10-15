@@ -73,7 +73,10 @@ type env struct {
 	srv  *Server
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWith(t, nil, nil) }
+
+// newEnvWith lets a test adjust the engine and API deps before start.
+func newEnvWith(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps)) *env {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), filepath.Join(dir, "v2", "plr.db"))
@@ -83,13 +86,21 @@ func newEnv(t *testing.T) *env {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ex := &fakeExec{}
 	fv := fakeVault{keys: []string{"Svc/TOKEN", "Other/TOKEN"}}
-	e := engine.New(engine.Deps{Store: st, Executors: map[string]target.Executor{model.TargetHTTP: ex}, Secrets: fv, Log: log,
-		RunTokenKey: []byte("run-key"), EnvKey: bytes.Repeat([]byte{1}, 32), MaxHTTPInflight: 8, MaxContainers: 1, DataDir: dir, RetentionDays: 60})
+	ed := engine.Deps{Store: st, Executors: map[string]target.Executor{model.TargetHTTP: ex}, Secrets: fv, Log: log,
+		RunTokenKey: []byte("run-key"), EnvKey: bytes.Repeat([]byte{1}, 32), MaxHTTPInflight: 8, MaxContainers: 1, DataDir: dir, RetentionDays: 60}
+	if engMod != nil {
+		engMod(&ed)
+	}
+	e := engine.New(ed)
 	if err := e.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	s := New(Deps{Engine: e, Store: st, Secrets: fv, Log: log, APIToken: adminToken, RunTokenKey: []byte("run-key"),
-		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}, Version: "test"})
+	ad := Deps{Engine: e, Store: st, Secrets: fv, Log: log, APIToken: adminToken, RunTokenKey: []byte("run-key"),
+		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}, Version: "test"}
+	if apiMod != nil {
+		apiMod(&ad)
+	}
+	s := New(ad)
 	hs := httptest.NewServer(s)
 	t.Cleanup(func() {
 		hs.Close()
