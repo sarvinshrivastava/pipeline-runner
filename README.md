@@ -1,216 +1,128 @@
 # pipeline-runner
 
-Scheduled data pipelines that actually run when they say they will.
+The VPS's central time service. Other services register **jobs** (a trigger plus an HTTP callback), and pipeline-runner calls them at the right moment, records every run, and pages ntfy when something goes wrong.
 
-**Day-to-day usage — subscribing to alerts, adding a cron, cron syntax,
-troubleshooting — is in [USAGE.md](USAGE.md).** This file covers design and
-operation.
+A single Go binary (`plr`) with SQLite and an embedded dashboard. Delivery 1a ships HTTP callback targets. Container and inline targets arrive in 1b.
 
-Register a pipeline over the API: a git repo, a container image, a command, and
-a cron expression. The runner clones the repo, runs your script in a throwaway
-container at the scheduled moment, commits whatever the script wrote back to a
-branch, and pings ntfy when something goes wrong.
+## How it behaves
 
-## Why this exists
+- **Triggers:**
 
-GitHub Actions' `schedule` event was the incumbent for this and proved
-unreliable — see `/root/apps/nidra-daily-push/learnings/github-cron-lag.md`.
-Two escalating episodes: a 30-minute lag onto a contended queue boundary, then
-**4–12 hour lags on every trigger for four consecutive days**. Three lessons are
-baked into this service's design:
+  | Trigger | Fires |
+  |---|---|
+  | `cron` | on a cron schedule; DST-aware with `timezone` |
+  | `at` | once, at a fixed instant |
+  | `delay` | once, after a duration from creation |
+  | `invoke` | on demand only (`POST /v1/jobs/{id}/invoke`, optionally `?wait=N`) |
 
-1. **More cron triggers is not redundancy.** All crons in a repo share one
-   queue, so extra triggers fail together, as one correlated batch.
-2. **A late run looks exactly like an on-time run.** Green ≠ on-time.
-3. **Suppressing false alarms creates silent failures.** The fix for lag noise
-   turned four genuinely missed days into green no-op runs with no alert at all.
+  Ad hoc one-off runs use `POST /v1/runs`.
+- **Firing:**
+  - Timers have millisecond precision, from an in-memory heap.
+  - Each job's next occurrence is persisted, so it survives restarts.
+- **Lateness:**
+  - A run later than `max_late_sec` is recorded as `missed` and paged. It never runs hours late.
+  - Occurrences that fell inside an outage or a backlog are **coalesced** into one run, counted in `plr_coalesced_occurrences_total`, and paged at most once per job every 10 minutes.
+- **Delivery:**
+  - `at_least_once` is the default; send `X-PLR-Run-Id` handling for idempotency.
+  - `at_most_once` never re-sends an ambiguous request; such runs are paged as **NEEDS A HUMAN**.
+  - Retries with backoff are opt-in through `policy.retry`.
+- **Callbacks:**
+  - In `sync` mode the HTTP response is the result.
+  - In `async` mode the target returns 202, then calls `POST /v1/runs/{id}/heartbeat` and `/complete` with the run token it received.
+  - The target can steer the schedule with `Retry-After` or `defer_until`.
+- **Concurrency:**
+  - `overlap` is `skip`, `queue` or `allow` per job.
+  - `concurrency_key` and `concurrency_limit` apply across a client's jobs.
+  - A global HTTP slot pool (`MAX_HTTP_INFLIGHT`) and a per-client cap (`MAX_HTTP_INFLIGHT_PER_CLIENT`) keep one client from starving the rest.
 
-So here: the trigger is a local 10-second tick with no shared queue; lateness is
-recorded and paged rather than absorbed; and every abnormal path notifies.
-
-## How scheduling behaves
-
-- Each enabled pipeline always has one `pending` run row for its next
-  occurrence, so "next run" is persisted and survives restarts.
-- A run more than `max_late_sec` late is **abandoned** as `missed` and paged.
-  It is never quietly run hours after the fact.
-- A run that fires late but inside the window still executes, records
-  `late_sec`, and pages if it exceeded `late_warn_sec`.
-- A long outage is collapsed into **one** notification naming how many
-  occurrences were missed, rather than a flood.
-- On boot, a container that outlived a restart is waited on and finished
-  properly. If it is gone, the run is `interrupted`; it is retried only if the
-  pipeline is marked `idempotent`, and otherwise pages a human.
-
-## Security model
-
-The service mounts `/var/run/docker.sock`, so **the API token is effectively a
-host-root credential**. Containment:
-
-- Every `/api/*` route requires the bearer token, compared in constant time,
-  with per-IP failure throttling. Only `/healthz` and the static dashboard shell
-  are open.
-- Pipelines supply an image and a command — **never docker flags**. Every flag
-  in the `docker run` argv is a literal written by the service.
-- All subprocesses are spawned with an **argv array**, never a shell string, so
-  no pipeline field reaches a host shell. `image` must start with an
-  alphanumeric, which is what blocks flag smuggling.
-- Runs get `--cap-drop ALL`, `--security-opt no-new-privileges`, memory/CPU/PID
-  caps and a hard timeout.
-- Per-pipeline env vars are AES-256-GCM encrypted at rest and delivered via a
-  `0600` env file that is deleted after the run.
-- **The git token never enters a pipeline's container.** Clone and push happen
-  service-side; the container only sees `/workspace`.
-
-## Configuration
-
-Secrets live in the secrets manager under the `PIPELINE_RUNNER_` prefix;
-`vps-deploy` strips it and writes `.env`. See `.env.example`.
-
-| Var | Purpose |
-|---|---|
-| `API_TOKEN` | Bearer token for the API. 32+ chars. Required. |
-| `ENCRYPTION_KEY` | 64 hex chars. Encrypts pipeline env at rest. Required. |
-| `GITHUB_TOKEN` | Default PAT (Contents r/w) for cloning and pushing. |
-| `HOST_DATA_DIR` | Host path bind-mounted at the identical path in-container. |
-| `NTFY_BASE` / `NTFY_TOPIC_OK` / `NTFY_TOPIC_FAIL` / `NTFY_TOKEN` | Status pings. |
-| `DASHBOARD_URL` | Linked from notifications. |
-
-> An unset secret arrives as an **empty string** through docker's `env_file`,
-> not as absent, so `config.ts` treats `""` as missing rather than relying on
-> `??`.
-
-A pipeline may override the git credential by setting `GIT_TOKEN` in its own
-env or secret refs; that key is consumed for auth and stripped before the
-container starts.
-
-## Secret references
-
-A pipeline does not have to store credentials itself. It can **reference** a key
-in the secrets manager, and the value is fetched fresh at run time:
-
-```json
-{
-  "secret_refs": {
-    "GIT_TOKEN": "Root/PIPELINE_RUNNER_GITHUB_TOKEN",
-    "WEATHER_API_KEY": "Root/MY_WEATHER_KEY"
-  }
-}
-```
-
-The value maps to the env var on the left. A bare `"MY_KEY"` is shorthand for
-`"Root/MY_KEY"`.
-
-Why references beat storing the value:
-
-- **Rotation is free.** Change the secret in the vault; the next run picks it up
-  with no pipeline edit and no redeploy.
-- **Nothing is duplicated.** The credential lives in exactly one place.
-- **Typos fail immediately.** References are checked against the live vault when
-  a pipeline is created or updated. A reference that does not resolve is a
-  `400` naming the exact bad key — not a 4am failure.
-
-```
-These secret references do not exist in the secrets manager:
-Root/DOES_NOT_EXST. Add them to the vault first, or fix the reference.
-```
-
-If a referenced secret is **deleted later**, two things catch it:
-`GET /api/pipelines/:id/validate` reports it (and the dashboard's "Check refs"
-button surfaces it), and the run itself fails loudly rather than starting
-without the credential.
-
-`GET /api/secrets` lists the key names available in the vault — names only,
-never values.
-
-### Reaching the vault
-
-`secret-manager` publishes only on `127.0.0.1:8000` of the *host*, so a
-container cannot reach it via `host-gateway`, and the two services live in
-different compose projects (hence isolated bridge networks). Rather than modify
-that service, the runner **joins secret-manager's docker network at boot** using
-the socket it already holds, then addresses it as `http://secret-manager:8000`.
-This is idempotent and re-run every boot, so it self-heals if either container
-is recreated.
-
-It needs `SECRET_MANAGER_TOKEN` — a **read** token is sufficient. Without it,
-pipelines that use no references still run normally.
+Every callback carries `X-PLR-Run-Id`, `X-PLR-Job`, `X-PLR-Trigger`, `X-PLR-Attempt` and `X-PLR-Scheduled-For`. When the job has an `hmac_ref`, it also carries `X-PLR-Signature`.
 
 ## API
 
-All routes need `Authorization: Bearer $API_TOKEN`.
+OpenAPI: `GET /v1/openapi.json`. Auth is `Authorization: Bearer <token>`. The admin token comes from `API_TOKEN`; per-client tokens come from `POST /v1/clients`.
 
-| Route | Purpose |
-|---|---|
-| `GET /healthz` | Liveness. 503 once the tick loop stalls. Unauthenticated. |
-| `GET/POST /api/pipelines` | List / create |
-| `GET/PATCH/DELETE /api/pipelines/:id` | Read / update / remove (`:id` may be the name) |
-| `POST /api/pipelines/:id/trigger` | Run now |
-| `POST /api/pipelines/:id/enable\|disable` | Toggle |
-| `GET /api/runs?pipeline=&status=&limit=` | Run history |
-| `GET /api/runs/:id` · `GET /api/runs/:id/logs` | Detail / logs |
-| `POST /api/runs/:id/cancel` | Kill a running container |
+| Area | Endpoints | Scope |
+|---|---|---|
+| Jobs | `GET/POST /v1/jobs`, `GET/PATCH/DELETE /v1/jobs/{id}`, `POST /v1/jobs/{id}/{invoke,enable,disable,validate}`, `POST /v1/jobs/validate` | `jobs:read`, `jobs:write`, `runs:invoke` |
+| Runs | `GET /v1/runs`, `GET /v1/runs/{id}`, `GET /v1/runs/{id}/logs`, `POST /v1/runs/{id}/cancel`, `POST /v1/runs` (ad hoc) | `jobs:read`, `runs:invoke`, `runs:adhoc` |
+| Async callbacks | `POST /v1/runs/{id}/heartbeat`, `POST /v1/runs/{id}/complete` | run token |
+| Clients | `GET/POST /v1/clients`, `PATCH/DELETE /v1/clients/{id}`, `POST /v1/clients/{id}/rotate` | `admin` |
+| Other | `GET /healthz`, `GET /v1/status`, `GET /v1/secrets` | none / bearer / `jobs:write` |
 
-Create a pipeline:
+**Client limits:** each client is limited to its own `callback_hosts` and `secret_ref_prefixes`, and an admin-scoped client sees every client's jobs and runs. **Write requests:** writes accept an `Idempotency-Key` header.
 
-```bash
-curl -X POST https://pipeline-runner.vps.sarvinshrivastava.space/api/pipelines \
-  -H "Authorization: Bearer $API_TOKEN" -H 'content-type: application/json' \
-  -d '{
-    "name": "rates-daily",
-    "repo_url": "https://github.com/owner/data-repo.git",
-    "branch": "main",
-    "image": "python:3.12-slim",
-    "command": "pip install -q requests && python fetch.py",
-    "cron": "17 6 * * *",
-    "timezone": "Asia/Kolkata",
-    "env": { "API_KEY": "…" }
-  }'
+Minimal job:
+
+```json
+{
+  "name": "publish-tick",
+  "trigger": { "type": "cron", "cron": "*/5 * * * *", "timezone": "Asia/Kolkata" },
+  "target": { "type": "http", "http": { "method": "POST", "url": "http://reel-drop:8080/internal/tick",
+              "mode": "sync", "auth": { "bearer_ref": "ReelDrop/TICK_TOKEN" } } },
+  "policy": { "max_late_sec": 120, "overlap": "skip" }
+}
 ```
 
-Your script just writes files into the working directory; whatever changed is
-committed and pushed. No file changes is a success, not a failure.
+Secrets are vault references (`Folder/KEY`), resolved at fire time from the secrets manager and never stored here.
 
-### Pipeline fields
+## Security model
 
-| Field | Default | Notes |
-|---|---|---|
-| `branch` / `output_branch` | `main` / same as `branch` | Read from / commit to |
-| `timeout_sec` | 900 | Container killed past this |
-| `max_late_sec` | 600 | Past this a run is abandoned as `missed` |
-| `late_warn_sec` | 60 | Past this a run still executes but pages |
-| `memory_mb` / `cpus` | 512 / 1.0 | Hard caps; swap disabled |
-| `idempotent` | `true` | May be auto-retried after an interrupted run |
-| `overlap_policy` | `skip` | `skip` or `queue` when a run is still going |
-| `commit_results` | `true` | Set false for a pipeline with no output |
-| `secret_refs` | `{}` | `ENV_VAR` → `Folder/KEY` in the vault; validated on save |
-| `notify_on_success` | `false` | Failures always notify |
+- **Binding:** the API is published only on `127.0.0.1` and fronted by the host nginx. `X-Forwarded-For` is honoured only from `TRUSTED_PROXIES`.
+- **Callbacks:**
+  - They go through an SSRF-guarded dialer. Loopback, link-local (including cloud metadata) and special-use ranges are always refused.
+  - Private addresses are allowed only for single-label Docker service names such as `reel-drop`. A dotted name or IP literal that resolves to one is refused, which also defeats DNS rebinding.
+  - The runner's own hosts and the vault are denied.
+  - A job with auth must use `https` unless its host is a Docker service name.
+  - Callback hosts are re-checked at fire time.
+- **Tokens and secrets:**
+  - Tokens are compared as digests.
+  - Run tokens are HMAC-signed with `RUN_TOKEN_KEY`.
+  - Sealed env values are encrypted with `ENCRYPTION_KEY`.
+  - Logs are redacted.
+- **Container:** non-root (uid 10001), read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, memory and pids limits. The dashboard is served under a strict CSP.
 
-## Run statuses
+## Configuration
 
-`pending` · `running` · `success` · `failed` · `missed` · `timeout` · `interrupted`
+Real values come from the secrets manager under the `PIPELINE_RUNNER_` prefix; `vps-deploy` writes `.env` at deploy time. `.env.example` lists everything.
 
-There is deliberately no `late` status — a late run still succeeded or failed,
-and collapsing that into one state would hide the outcome. Lateness is recorded
-on `late_sec`.
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `API_TOKEN` | yes | | admin bearer token (32+ chars) |
+| `ENCRYPTION_KEY`, `RUN_TOKEN_KEY` | yes | | 64 hex chars each, and different from each other |
+| `TRUSTED_PROXIES` | yes | | proxy address as the container sees it, or `none` |
+| `SECRET_MANAGER_URL`, `SECRET_MANAGER_TOKEN` | yes | | vault read access |
+| `NTFY_BASE`, `NTFY_TOPIC_OK`, `NTFY_TOPIC_FAIL`, `NTFY_TOKEN` | | `https://ntfy.sh` | pages |
+| `HEARTBEAT_URL` | | | Uptime Kuma push URL, pinged every 60 s while the engine is healthy |
+| `MAX_HTTP_INFLIGHT` | | 64 | global HTTP callback slots |
+| `MAX_HTTP_INFLIGHT_PER_CLIENT` | | 16 | per-client share of those slots (0 = no cap) |
+| `RUN_RETENTION_DAYS` | | 60 | run history kept; sub-minute jobs keep 7 days |
+
+## Operations
+
+- **Health:** `GET /healthz` returns 503 if the engine loop stalls for more than 60 s. The compose healthcheck runs `plr healthcheck`, and autoheal restarts the container.
+- **Metrics:** Prometheus on `:9464`, internal networks only. Key series:
+  - `plr_fire_delay_seconds`, `plr_runs_total{status}` and `plr_pending_runs`;
+  - `plr_queue_depth`, `plr_inflight` and `plr_coalesced_occurrences_total`.
+- **Shutdown:** in-flight callbacks get a 20 s drain. Boot recovery then re-dispatches `at_least_once` runs inside their window and interrupts the rest.
+- **Capacity:** a 1-CPU, 512 MB container sustained 800 req/s of mixed API load with 100 every-second cron jobs in load tests (2026-10-14). Expected production load is about 5 req/s.
 
 ## Development
 
-```bash
-bun install
-bun test
-bun run typecheck
-bun run dev
+```sh
+go build ./...
+golangci-lint run ./... --build-tags bench
+go test -race ./...
+DATA_DIR=$PWD/data go run ./cmd/plr serve   # also needs the required variables above
 ```
 
-No host `bun` needed — the container image works too:
-
-```bash
-docker run --rm -v "$PWD:/app" -w /app oven/bun:1-alpine bun test
-```
+The in-process load hold runs behind the `bench` tag: `go test -tags bench -run TestLoadHold ./cmd/plr`.
 
 ## Deploy
 
-Push to `main`, then run the `deploy` workflow (manual `workflow_dispatch`, so
-a stray push cannot deploy). It SSHes to the VPS, pulls, and runs
-`vps-deploy pipeline-runner /root/apps/pipeline-runner`.
+Deploys are manual through the **deploy** GitHub Actions workflow (`workflow_dispatch`), which deploys `main`:
+
+1. `git pull` on the VPS, then `vps-deploy`. The image is tagged `pipeline-runner:<short-sha>`, and the five newest tags are kept.
+2. **Rollback:** run the same workflow with `rollback_sha`. It re-tags a kept image, with no rebuild.
+   - A binary older than the database schema refuses to start. In that case, roll forward.
+
+The data directory (`HOST_DATA_DIR`, default `/root/pipeline-runner-data`) is created and chowned to uid 10001 by the workflow.
