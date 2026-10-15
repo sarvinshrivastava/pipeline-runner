@@ -48,7 +48,7 @@ func (s *Server) routeTable() []route {
 		{"GET", "/v1/runs", authBearer, model.ScopeJobsRead, c(200, 400, 401, 403), false, s.listRuns},
 		{"POST", "/v1/runs", authBearer, model.ScopeRunsAdhoc, c(200, 202, 400, 401, 403, 409, 413, 503), false, s.createAdhoc},
 		{"GET", "/v1/runs/{id}", authBearer, model.ScopeJobsRead, c(200, 401, 403, 404), false, s.getRun},
-		{"GET", "/v1/runs/{id}/logs", authBearer, model.ScopeJobsRead, c(200, 401, 403, 404), false, s.runLogs},
+		{"GET", "/v1/runs/{id}/logs", authBearer, model.ScopeJobsRead, c(200, 400, 401, 403, 404), false, s.runLogs},
 		{"POST", "/v1/runs/{id}/cancel", authBearer, model.ScopeRunsInvoke, c(200, 202, 401, 403, 404, 409), false, s.cancelRun},
 		{"POST", "/v1/runs/{id}/heartbeat", authRunToken, "", c(200, 401, 409), false, s.heartbeat},
 		{"POST", "/v1/runs/{id}/complete", authRunToken, "", c(200, 202, 400, 401, 409, 413), false, s.complete},

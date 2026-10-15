@@ -40,6 +40,11 @@ type Deps struct {
 	Static         http.Handler // dashboard; nil disables it
 	DockerStatus   func(ctx context.Context) string
 	Now            func() time.Time
+	// StreamTiming and the stream limits tune live log streams; zero values
+	// take the defaults.
+	StreamTiming       *StreamTiming
+	StreamMaxPerClient int
+	StreamMaxTotal     int
 }
 
 // Server is the API handler.
@@ -48,6 +53,10 @@ type Server struct {
 	mux     *http.ServeMux
 	limiter *limiter
 	routes  []route
+	streams *streamLimits
+	timing  StreamTiming
+	// authFn re-checks a live stream's token; tests replace it.
+	authFn func(*http.Request) (model.Principal, error)
 }
 
 // New builds the handler.
@@ -55,7 +64,18 @@ func New(d Deps) *Server {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
-	s := &Server{d: d, mux: http.NewServeMux(), limiter: newLimiter(10, 5*time.Minute, 10000, d.Now)}
+	s := &Server{d: d, mux: http.NewServeMux(), limiter: newLimiter(10, 5*time.Minute, 10000, d.Now), timing: defaultStreamTiming()}
+	if d.StreamTiming != nil {
+		s.timing = *d.StreamTiming
+	}
+	s.streams = &streamLimits{per: map[string]int{}, maxPer: streamMaxPerClient, maxTotal: streamMaxTotal}
+	if d.StreamMaxPerClient > 0 {
+		s.streams.maxPer = d.StreamMaxPerClient
+	}
+	if d.StreamMaxTotal > 0 {
+		s.streams.maxTotal = d.StreamMaxTotal
+	}
+	s.authFn = s.authenticate
 	s.routes = s.routeTable()
 	for _, rt := range s.routes {
 		if rt.static && d.Static == nil {

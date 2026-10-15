@@ -256,6 +256,27 @@ func HasScheduleRunFor(ctx context.Context, q Querier, jobID string, nominal tim
 	return n > 0, err
 }
 
+// RunStatus reads only a run's status.
+func RunStatus(ctx context.Context, q Querier, id string) (model.Status, error) {
+	var s string
+	err := q.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, id).Scan(&s)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return model.Status(s), err
+}
+
+// SuccessorOf returns the id of the run that continues r's chain (a retry or
+// a defer), or "" when there is none.
+func SuccessorOf(ctx context.Context, q Querier, r model.Run) (string, error) {
+	var id string
+	err := q.QueryRowContext(ctx, `SELECT id FROM runs WHERE chain_root_id = ? AND parent_run_id = ? LIMIT 1`, r.ChainRootID, r.ID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
 // CountInFlightOnDemand counts a client's runs in flight (pending, running or
 // waiting) other than schedule runs: invokes, ad hoc runs and their retries
 // and defers. Schedule runs are bounded by the job limit.

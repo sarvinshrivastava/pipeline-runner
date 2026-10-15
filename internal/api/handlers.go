@@ -500,6 +500,14 @@ func (s *Server) runLogs(w http.ResponseWriter, r *http.Request) {
 		fail(w, s.d.Log, err)
 		return
 	}
+	switch follow, ok := parseFollow(r); {
+	case !ok:
+		writeError(w, http.StatusBadRequest, "invalid", "follow must be 1, true, 0 or false")
+		return
+	case follow:
+		s.followLogs(w, r, run)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	f, err := os.Open(s.d.Engine.LogPath(run.ID))
 	if errors.Is(err, fs.ErrNotExist) {

@@ -56,6 +56,17 @@ OpenAPI: `GET /v1/openapi.json`. Auth is `Authorization: Bearer <token>`. The ad
 
 **Client limits:** each client is limited to its own `callback_hosts` and `secret_ref_prefixes`, and an admin-scoped client sees every client's jobs and runs. **Write requests:** writes accept an `Idempotency-Key` header.
 
+**Live logs:** instead of polling the log, follow it as Server-Sent Events:
+
+```sh
+curl -N -H "Authorization: Bearer $TOKEN" "https://<host>/v1/runs/<run-id>/logs?follow=1"
+```
+
+- **Events:** `status` on connect and on each change; `log` carrying new bytes, whose `id` is the byte offset; and a final `end` with `{status, reason, successor_run_id?}`. A `: ping` arrives every 15 s.
+- **Resuming:** reconnect with `Last-Event-ID` to continue from that offset. Line ends arrive as `\n`.
+- **Limits:** 4 streams per client and 128 in total (past that, `429 too_many_streams`). A stream lasts at most 1 h. The token is re-checked every 60 s. Catch-up covers the last 16 MiB, read 256 KiB per tick.
+- **Dashboard:** the run dialog follows live while it is open.
+
 Minimal job:
 
 ```json

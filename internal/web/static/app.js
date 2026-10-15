@@ -179,14 +179,126 @@ function showRuns(jobId) {
   selectTab("runs");
 }
 
+const TERMINAL = new Set(["success", "failed", "timeout", "missed", "skipped", "interrupted", "cancelled", "deferred"]);
+const LOG_CAP = 2 << 20; // characters kept in the dialog
+let currentRunId = null;
+let logStream = null; // AbortController of the open live log stream
+
+function stopLogStream() {
+  if (logStream) { logStream.abort(); logStream = null; }
+}
+
+function setLog(text) { $("log-body").textContent = text; }
+
+function appendLog(text) {
+  const body = $("log-body");
+  let t = body.dataset.live === "1" ? body.textContent + text : text;
+  body.dataset.live = "1";
+  if (t.length > LOG_CAP) t = "…trimmed…\n" + t.slice(t.length - LOG_CAP);
+  body.textContent = t;
+}
+
+function setRunTitle(run, status) { $("run-title").textContent = `${run.job_name} · ${status}`; }
+
 async function openRun(id) {
+  stopLogStream();
+  currentRunId = id;
   let run;
   try { run = await api("GET", `/v1/runs/${id}`); } catch (e) { alertError(e); return; }
-  $("run-title").textContent = `${run.job_name} · ${run.status}`;
+  if (currentRunId !== id) return; // another run was opened meanwhile
+  setRunTitle(run, run.status);
   $("run-json").textContent = JSON.stringify(run, null, 2);
-  $("log-body").textContent = "loading…";
-  $("run-dialog").showModal();
-  try { $("log-body").textContent = (await api("GET", `/v1/runs/${id}/logs`)) || "(empty)"; } catch (e) { $("log-body").textContent = e.message; }
+  $("log-body").dataset.live = "";
+  setLog("loading…");
+  if (!$("run-dialog").open) $("run-dialog").showModal();
+  if (TERMINAL.has(run.status)) { await loadLogSnapshot(id); return; }
+  followRun(run, "", 0);
+}
+
+async function loadLogSnapshot(id, note) {
+  try {
+    const text = await api("GET", `/v1/runs/${id}/logs`);
+    if (currentRunId === id) setLog((note ? note + "\n\n" : "") + (text || "(empty)"));
+  } catch (e) { if (currentRunId === id) setLog(e.message); }
+}
+
+// followRun reads the Server-Sent Events stream with fetch (EventSource cannot
+// send the bearer header) and resumes from the last event id after a drop.
+async function followRun(run, lastId, tries) {
+  const id = run.id;
+  const ctl = new AbortController();
+  logStream = ctl;
+  const headers = { Authorization: "Bearer " + token() };
+  if (lastId) headers["Last-Event-ID"] = lastId;
+  let res;
+  try {
+    res = await fetch(`/v1/runs/${id}/logs?follow=1`, { headers, signal: ctl.signal });
+  } catch (e) {
+    if (!ctl.signal.aborted) retryFollow(run, lastId, tries);
+    return;
+  }
+  if (currentRunId !== id || ctl.signal.aborted) return;
+  if (res.status === 401) { signOut("Token rejected."); return; }
+  if (res.status === 429) { await loadLogSnapshot(id, "Too many live log streams open; showing a snapshot."); return; }
+  if (!res.ok) { retryFollow(run, lastId, tries); return; }
+  if (!lastId) setLog("");
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = "";
+  let ev = { name: "", id: "", data: [] };
+  let ended = false;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line === "") {
+          if (ev.name && currentRunId === id) {
+            if (ev.id) lastId = ev.id;
+            ended = onStreamEvent(run, ev.name, ev.data.join("\n"), lastId, tries) || ended;
+          }
+          ev = { name: "", id: "", data: [] };
+        } else if (line.startsWith("event: ")) ev.name = line.slice(7);
+        else if (line.startsWith("id: ")) ev.id = line.slice(4);
+        else if (line.startsWith("data: ")) ev.data.push(line.slice(6));
+        else if (line === "data:") ev.data.push("");
+      }
+    }
+  } catch { /* aborted or dropped */ }
+  if (!ended && !ctl.signal.aborted && currentRunId === id) retryFollow(run, lastId, tries);
+}
+
+function retryFollow(run, lastId, tries) {
+  if (tries >= 5 || currentRunId !== run.id) return;
+  const delay = 3000 + Math.floor(Math.random() * 1000);
+  setTimeout(() => { if (currentRunId === run.id && $("run-dialog").open) followRun(run, lastId, tries + 1); }, delay);
+}
+
+// onStreamEvent handles one event; it reports whether the stream ended.
+function onStreamEvent(run, name, data, lastId, tries) {
+  if (name === "log") { appendLog(data); return false; }
+  let msg = {};
+  try { msg = JSON.parse(data); } catch { return false; }
+  if (name === "status") { setRunTitle(run, msg.status); return false; }
+  if (name !== "end") return false;
+  setRunTitle(run, msg.status);
+  switch (msg.reason) {
+    case "unauthorized": signOut("Token rejected."); break;
+    case "timeout": setTimeout(() => followRun(run, lastId, 0), 0); break;
+    case "shutdown": retryFollow(run, lastId, tries); break;
+    case "deleted": appendLog("\n[run deleted]"); break;
+    case "truncated": appendLog("\n[log was rewritten; reopen the run]"); break;
+    case "error": appendLog("\n[log could not be read]"); break;
+    default:
+      api("GET", `/v1/runs/${run.id}`).then((r) => {
+        if (currentRunId === run.id) $("run-json").textContent = JSON.stringify(r, null, 2);
+      }).catch(() => {});
+      if (msg.successor_run_id) appendLog(`\n[next attempt: ${msg.successor_run_id}]`);
+  }
+  return true;
 }
 
 const JOB_TEMPLATE = {
@@ -253,6 +365,8 @@ async function health() {
 }
 
 function signOut(msg) {
+  stopLogStream();
+  currentRunId = null;
   setToken("");
   $("app").hidden = true;
   $("signout-btn").hidden = true;
@@ -302,6 +416,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("client-dialog").addEventListener("close", () => { $("client-report").textContent = ""; });
   $("client-save").addEventListener("click", saveClient);
   $("run-close").addEventListener("click", () => $("run-dialog").close());
+  // close fires for the button and for Escape alike.
+  $("run-dialog").addEventListener("close", () => { stopLogStream(); currentRunId = null; });
 
   health();
   setInterval(health, 30000);

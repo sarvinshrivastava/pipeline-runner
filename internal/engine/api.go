@@ -460,6 +460,9 @@ func (e *Engine) Adhoc(ctx context.Context, owner model.Principal, in model.Adho
 	return r, nil
 }
 
+// Stopping is closed when Stop begins; long-lived API streams end on it.
+func (e *Engine) Stopping() <-chan struct{} { return e.stopping }
+
 // checkPendingLimit refuses a new on-demand run once the client has
 // MaxPendingPerClient non-schedule runs in flight (their retries and defers
 // included). With the job limit (one pending schedule run per job) it bounds

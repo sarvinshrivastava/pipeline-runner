@@ -71,12 +71,19 @@ type env struct {
 	exec *fakeExec
 	st   *store.Store
 	srv  *Server
+	eng  *engine.Engine
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, nil, nil) }
 
 // newEnvWith lets a test adjust the engine and API deps before start.
 func newEnvWith(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps)) *env {
+	t.Helper()
+	return newEnvWithServer(t, engMod, apiMod, nil)
+}
+
+// newEnvWithServer also lets a test set the http.Server (timeouts) before it starts.
+func newEnvWithServer(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps), srvMod func(*http.Server)) *env {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), filepath.Join(dir, "v2", "plr.db"))
@@ -101,7 +108,11 @@ func newEnvWith(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps)) *en
 		apiMod(&ad)
 	}
 	s := New(ad)
-	hs := httptest.NewServer(s)
+	hs := httptest.NewUnstartedServer(s)
+	if srvMod != nil {
+		srvMod(hs.Config)
+	}
+	hs.Start()
 	t.Cleanup(func() {
 		hs.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -109,7 +120,7 @@ func newEnvWith(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps)) *en
 		e.Stop(ctx, time.Now())
 		_ = st.Close()
 	})
-	return &env{t: t, url: hs.URL, exec: ex, st: st, srv: s}
+	return &env{t: t, url: hs.URL, exec: ex, st: st, srv: s, eng: e}
 }
 
 type resp struct {

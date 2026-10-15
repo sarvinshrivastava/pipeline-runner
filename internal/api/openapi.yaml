@@ -438,8 +438,28 @@ paths:
     parameters: [{$ref: '#/components/parameters/id'}]
     get:
       operationId: getRunLogs
+      description: |
+        Without follow, the log so far as plain text (up to 16 MiB). With follow=1, a live
+        Server-Sent Events stream instead of polling:
+          - event "status": {"status"} on connect and on every change.
+          - event "log": new log bytes; "id" is the byte offset after them. Line ends arrive
+            as \n; the id counts raw file bytes. A resume beyond 16 MiB behind starts with a
+            "[N bytes skipped]" chunk.
+          - event "end": {"status", "reason", "successor_run_id"?}, then the server closes.
+            reason is finished | timeout (after 1 h) | shutdown | unauthorized | deleted |
+            truncated | error. finished, timeout and shutdown send the remaining bytes first.
+            successor_run_id names a retry or defer that continues the run.
+          - a ": ping" comment every 15 s.
+        Resume with the Last-Event-ID header (it wins over ?offset=). At most 4 streams per
+        client and 128 in total (429 too_many_streams). The token is re-checked every 60 s.
+        A late completion note on an interrupted run is not streamed.
+      parameters:
+        - {name: follow, in: query, schema: {type: string, enum: ["0", "1", "true", "false"]}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0}}
+        - {name: Last-Event-ID, in: header, schema: {type: string}}
       responses:
-        "200": {description: "Plain-text log (container output, or a request/response summary for HTTP runs)", content: {text/plain: {}}}
+        "200": {description: "Plain-text log (container output, or a request/response summary for HTTP runs), or with follow=1 an event stream", content: {text/plain: {}, text/event-stream: {}}}
+        "400": {$ref: '#/components/responses/Error'}
         "401": {$ref: '#/components/responses/Error'}
         "403": {$ref: '#/components/responses/Error'}
         "404": {$ref: '#/components/responses/Error'}

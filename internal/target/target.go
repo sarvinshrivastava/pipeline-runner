@@ -47,6 +47,8 @@ type Result struct {
 }
 
 // Executor runs one target type.
+// The run's log file at ExecInput.LogPath is complete when Execute returns:
+// live log followers drain it once the run is terminal.
 type Executor interface {
 	Execute(ctx context.Context, in ExecInput) Result
 }
