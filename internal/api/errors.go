@@ -42,6 +42,7 @@ var errorTable = []struct {
 	{engine.ErrNotAsync, http.StatusConflict, "run_not_async"},
 	{engine.ErrConflict, http.StatusConflict, "completion_conflict"},
 	{engine.ErrJobLimit, http.StatusConflict, "job_limit"},
+	{engine.ErrPendingLimit, http.StatusTooManyRequests, "pending_limit"},
 	{engine.ErrNameTaken, http.StatusConflict, "name_taken"},
 	{store.ErrHasJobs, http.StatusConflict, "client_has_jobs"},
 	{engine.ErrVaultDown, http.StatusServiceUnavailable, "vault_unavailable"},

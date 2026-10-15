@@ -45,10 +45,12 @@ type Config struct {
 	MaxHTTPInflight int
 	// MaxHTTPPerClient bounds one client's share of the HTTP slots; 0 is no cap.
 	MaxHTTPPerClient int
-	MaxContainers    int
-	PullTimeoutSec   int
-	LogMaxBytes      int64
-	RunRetentionDays int
+	// MaxPendingPerClient bounds one client's queued on-demand runs; 0 is no bound.
+	MaxPendingPerClient int
+	MaxContainers       int
+	PullTimeoutSec      int
+	LogMaxBytes         int64
+	RunRetentionDays    int
 
 	EnableContainerTargets bool
 }
@@ -87,12 +89,13 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 
 		TrustedProxies: r.trustedProxies(),
 
-		MaxHTTPInflight:  r.int("MAX_HTTP_INFLIGHT", 64),
-		MaxHTTPPerClient: r.int("MAX_HTTP_INFLIGHT_PER_CLIENT", 16),
-		MaxContainers:    r.int("MAX_CONTAINERS", 4),
-		PullTimeoutSec:   r.int("PULL_TIMEOUT_SEC", 300),
-		LogMaxBytes:      int64(r.int("LOG_MAX_BYTES", 5*1024*1024)),
-		RunRetentionDays: r.int("RUN_RETENTION_DAYS", 60),
+		MaxHTTPInflight:     r.int("MAX_HTTP_INFLIGHT", 64),
+		MaxHTTPPerClient:    r.int("MAX_HTTP_INFLIGHT_PER_CLIENT", 16),
+		MaxPendingPerClient: r.int("MAX_PENDING_PER_CLIENT", 1000),
+		MaxContainers:       r.int("MAX_CONTAINERS", 4),
+		PullTimeoutSec:      r.int("PULL_TIMEOUT_SEC", 300),
+		LogMaxBytes:         int64(r.int("LOG_MAX_BYTES", 5*1024*1024)),
+		RunRetentionDays:    r.int("RUN_RETENTION_DAYS", 60),
 
 		EnableContainerTargets: r.bool("ENABLE_CONTAINER_TARGETS", false),
 	}
@@ -113,8 +116,8 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	if c.MaxHTTPInflight < 1 || c.MaxContainers < 1 {
 		errs = append(errs, errors.New("MAX_HTTP_INFLIGHT and MAX_CONTAINERS must be at least 1"))
 	}
-	if c.MaxHTTPPerClient < 0 {
-		errs = append(errs, errors.New("MAX_HTTP_INFLIGHT_PER_CLIENT must be at least 0 (0 = no cap)"))
+	if c.MaxHTTPPerClient < 0 || c.MaxPendingPerClient < 0 {
+		errs = append(errs, errors.New("MAX_HTTP_INFLIGHT_PER_CLIENT and MAX_PENDING_PER_CLIENT must be at least 0 (0 = no limit)"))
 	}
 	if c.RunRetentionDays < 1 {
 		errs = append(errs, errors.New("RUN_RETENTION_DAYS must be at least 1"))

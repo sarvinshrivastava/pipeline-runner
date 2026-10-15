@@ -75,12 +75,12 @@ func (c *stmtCache) stmt(ctx context.Context, db *sql.DB, query string) *sql.Stm
 	c.mu.Lock()
 	if s := c.m[query]; s != nil { // a racing caller won
 		c.mu.Unlock()
-		_ = p.Close()
+		c.closeSurplus(p)
 		return s
 	}
 	if len(c.m) >= maxCachedStmts {
 		c.mu.Unlock()
-		_ = p.Close()
+		c.closeSurplus(p)
 		c.warnFull()
 		return nil
 	}
@@ -98,6 +98,12 @@ func (c *stmtCache) atCap() bool {
 	}
 	c.warnFull()
 	return true
+}
+
+func (c *stmtCache) closeSurplus(p *sql.Stmt) {
+	if err := p.Close(); err != nil {
+		c.log.Warn("close surplus prepared statement", "err", err)
+	}
 }
 
 func (c *stmtCache) warnFull() {
@@ -274,9 +280,9 @@ func (t *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *sq
 func (t *Tx) Commit() error {
 	if h := t.db.c.commitHook.Load(); h != nil {
 		if err := (*h)(); err != nil {
-			_ = t.Tx.Rollback()
+			rerr := t.Tx.Rollback()
 			t.prepareMissed()
-			return err
+			return errors.Join(err, rerr)
 		}
 	}
 	err := t.Tx.Commit()
@@ -291,6 +297,8 @@ func (t *Tx) Rollback() error {
 	return err
 }
 
+// prepareMissed runs after the transaction ends, so it does not use the
+// transaction's context: a cancelled request must not stop the cache filling.
 func (t *Tx) prepareMissed() {
 	missed := t.missed
 	t.missed = nil

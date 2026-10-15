@@ -64,7 +64,7 @@ func New(loopAge func() float64) *Metrics {
 			Name: "plr_engine_loop_age_seconds", Help: "Seconds since the engine loop last completed an iteration.",
 		}, loopAge),
 		Coalesced: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "plr_coalesced_occurrences_total", Help: "Cron occurrences coalesced into a later run instead of running.",
+			Name: "plr_coalesced_occurrences_total", Help: "Cron occurrences that did not run: folded into a later run (reason=backlog) or past max_late_sec (reason=expired).",
 		}, []string{"job", "client", "reason"}),
 		series: map[[2]string]struct{}{},
 	}

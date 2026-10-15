@@ -57,6 +57,7 @@ func countStatus(h *harness, statuses ...model.Status) int {
 func waitCount(h *harness, want int, statuses ...model.Status) {
 	h.t.Helper()
 	h.waitFor(fmt.Sprintf("%d runs %v", want, statuses), func() bool { return countStatus(h, statuses...) == want })
+	h.sync() // the statuses commit before the handlers' post-commit work
 }
 
 // waitJobRun waits, without GetRun, until the job's run id has status want.
@@ -389,4 +390,30 @@ func TestWakeKeepsHeadOnTransientReadError(t *testing.T) {
 	h.st.R.SetFaultHook(nil)
 	h.onLoop(func() { h.e.wake("pool:" + poolHTTP) })
 	waitJobRun(h, j.ID, b.ID, model.StatusSuccess)
+}
+
+// A stale cached row past max_late loses its finalize and pages nothing.
+func TestStaleRowPastMaxLateIsNotPagedMissed(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("f", &model.PolicyIn{MaxLateSec: ptr(int64(1))}))
+	ctx := context.Background()
+	r := pendingInvoke(j, h.clk.Now().Add(2*time.Second), nil)
+	if err := store.InsertRun(ctx, h.st.W, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.send(ctx, evRunInserted{runs: []model.Run{r}}); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+	if ok, err := store.Transition(ctx, h.st.W, r.ID, []model.Status{model.StatusPending}, model.StatusCancelled, store.Fields{"finished_at": h.clk.Now()}); err != nil || !ok {
+		t.Fatalf("cancel: %v %v", ok, err)
+	}
+	h.advance(4 * time.Second) // past max_late: the missed branch, on a stale row
+	h.sync()
+	if n := h.pager.count("missed"); n != 0 {
+		t.Fatalf("missed pages = %d (%v)", n, h.pager.titles())
+	}
+	if got := h.run(r.ID); got.Status != model.StatusCancelled {
+		t.Fatalf("status = %s", got.Status)
+	}
 }

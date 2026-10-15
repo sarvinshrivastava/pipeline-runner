@@ -108,17 +108,17 @@ func (f *fakeExec) callCount() int {
 }
 
 type harness struct {
-	t       *testing.T
-	e       *Engine
-	st      *store.Store
-	clk     *FakeClock
-	exec    *fakeExec
-	pager   *fakePager
-	owner   model.Principal
-	dir     string
-	maxHTTP int
+	t         *testing.T
+	e         *Engine
+	st        *store.Store
+	clk       *FakeClock
+	exec      *fakeExec
+	pager     *fakePager
+	owner     model.Principal
+	dir       string
+	maxHTTP   int
 	perClient int // 0: no per-client cap, so existing tests run uncapped
-	metrics *metrics.Metrics
+	metrics   *metrics.Metrics
 }
 
 type opt func(*harness)

@@ -39,6 +39,7 @@ var (
 	ErrNotAsync        = errors.New("run is not an async http run")
 	ErrConflict        = errors.New("a different completion was already recorded")
 	ErrJobLimit        = errors.New("client job limit reached")
+	ErrPendingLimit    = errors.New("client pending run limit reached")
 	ErrVaultDown       = errors.New("secrets manager unavailable")
 	ErrNameTaken       = errors.New("a job with this name already exists")
 	ErrShuttingDown    = errors.New("shutting down")
@@ -71,23 +72,26 @@ type ContainerRuntime interface {
 
 // Deps are the engine's collaborators.
 type Deps struct {
-	Store             *store.Store
-	Clock             Clock
-	Executors         map[string]target.Executor // by target type
-	Secrets           SecretSource
-	Pager             Pager
-	Metrics           *metrics.Metrics
-	Log               *slog.Logger
-	RunTokenKey       []byte
-	EnvKey            []byte
-	MaxHTTPInflight   int
-	MaxHTTPPerClient  int // one client's share of MaxHTTPInflight; 0 is no cap
-	MaxContainers     int
-	DataDir           string
-	RetentionDays     int
-	ContainersEnabled bool
-	Containers        ContainerRuntime
-	Rand              func(n int64) int64 // jitter source; defaults to math/rand
+	Store            *store.Store
+	Clock            Clock
+	Executors        map[string]target.Executor // by target type
+	Secrets          SecretSource
+	Pager            Pager
+	Metrics          *metrics.Metrics
+	Log              *slog.Logger
+	RunTokenKey      []byte
+	EnvKey           []byte
+	MaxHTTPInflight  int
+	MaxHTTPPerClient int // one client's share of MaxHTTPInflight; 0 is no cap
+	// MaxPendingPerClient bounds the pending runs a client may queue through
+	// invoke and ad hoc requests; 0 is no bound.
+	MaxPendingPerClient int
+	MaxContainers       int
+	DataDir             string
+	RetentionDays       int
+	ContainersEnabled   bool
+	Containers          ContainerRuntime
+	Rand                func(n int64) int64 // jitter source; defaults to math/rand
 	// CallbackPolicy is the dial-time IP policy; the validate checks apply
 	// it to the resolved callback host. nil skips that check.
 	CallbackPolicy secure.IPPolicy

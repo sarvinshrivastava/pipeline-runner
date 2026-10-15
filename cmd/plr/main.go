@@ -107,6 +107,10 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "v2", "logs"), 0o700); err != nil {
 		return err
 	}
+	if cfg.MaxHTTPPerClient == 0 || cfg.MaxHTTPPerClient >= cfg.MaxHTTPInflight {
+		log.Warn("per-client HTTP cap is off: one client can hold every HTTP slot",
+			"MAX_HTTP_INFLIGHT_PER_CLIENT", cfg.MaxHTTPPerClient, "MAX_HTTP_INFLIGHT", cfg.MaxHTTPInflight)
+	}
 	st, err := store.Open(ctx, filepath.Join(cfg.DataDir, "v2", "plr.db"))
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -132,7 +136,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	eng = engine.New(engine.Deps{
 		Store: st, Executors: executors, Secrets: vc, Pager: pager, Metrics: m, Log: log,
 		RunTokenKey: cfg.RunTokenKey, EnvKey: cfg.EncryptionKey, MaxHTTPInflight: cfg.MaxHTTPInflight,
-		MaxHTTPPerClient: cfg.MaxHTTPPerClient,
+		MaxHTTPPerClient: cfg.MaxHTTPPerClient, MaxPendingPerClient: cfg.MaxPendingPerClient,
 		MaxContainers: cfg.MaxContainers, DataDir: cfg.DataDir, RetentionDays: cfg.RunRetentionDays,
 		ContainersEnabled: false, // container/inline targets arrive in delivery 1b
 		CallbackPolicy:    callbackPolicy,

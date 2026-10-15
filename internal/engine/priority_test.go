@@ -3,11 +3,13 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/target"
 )
 
@@ -125,6 +127,7 @@ func TestPriorityAgingBoundsWait(t *testing.T) {
 			g.passJob(low.ID)
 			g.passJob(high.ID)
 			rl := invoke(t, h, low.ID)
+			h.sync() // parked now: its wait starts here
 			h.advance(tc.wait)
 			rh := invoke(t, h, high.ID)
 			h.sync()
@@ -369,4 +372,98 @@ func asyncJobWith(name string, p *model.PolicyIn) model.JobCreate {
 	in.Target.HTTP.Mode = "async"
 	in.Target.HTTP.LeaseSec = ptr(int64(60))
 	return in
+}
+
+func TestKeyListOrdersByPriority(t *testing.T) {
+	h := newHarness(t)
+	g := newRunGates(h)
+	keyed := func(name, prio string) model.JobCreate {
+		return invokeJob(name, &model.PolicyIn{ConcurrencyKey: ptr("k"), Priority: ptr(prio)})
+	}
+	hold := invoke(t, h, h.create(keyed("hold", "normal")).ID)
+	waitJobRun(h, hold.JobID, hold.ID, model.StatusRunning)
+	low, norm, high := h.create(keyed("low", "low")), h.create(keyed("norm", "normal")), h.create(keyed("high", "high"))
+	for _, j := range []model.Job{low, norm, high} {
+		g.passJob(j.ID)
+	}
+	rl, rn, rh := invoke(t, h, low.ID), invoke(t, h, norm.ID), invoke(t, h, high.ID)
+	h.sync()
+	var list string
+	h.onLoop(func() { list = h.e.parked[rl.ID] })
+	if list == "" || list[:4] != "key:" {
+		t.Fatalf("setup: low parked on %q, want a key list", list)
+	}
+	g.open(hold.ID)
+	waitCount(h, 4, model.StatusSuccess)
+	wantOrder(t, callOrder(h), hold.ID, rh.ID, rn.ID, rl.ID)
+}
+
+func TestDeleteJobDropsCappedRunMeta(t *testing.T) {
+	h := newHarness(t, withMaxHTTP(4), withPerClient(1))
+	g := newRunGates(h)
+	a := h.create(invokeJob("a", nil))
+	other := h.create(invokeJob("other", nil))
+	a1 := invoke(t, h, a.ID)
+	waitJobRun(h, a.ID, a1.ID, model.StatusRunning)
+	invoke(t, h, other.ID) // same client: capped, parks
+	h.sync()
+	var parked, meta int
+	h.onLoop(func() { parked, meta = len(h.e.parked), len(h.e.meta) })
+	if parked != 1 || meta != 1 {
+		t.Fatalf("setup: parked %d, meta %d", parked, meta)
+	}
+	if err := h.e.DeleteJob(context.Background(), other.ID); err != nil {
+		t.Fatal(err)
+	}
+	g.open(a1.ID)
+	waitJobRun(h, a.ID, a1.ID, model.StatusSuccess)
+	h.onLoop(func() { parked, meta = len(h.e.parked), len(h.e.meta) })
+	if parked != 0 || meta != 0 {
+		t.Fatalf("parked %d, meta %d after delete; want 0", parked, meta)
+	}
+}
+
+// A backdated due time ranks no earlier than one full aging span ago.
+func TestBackdatedRunCannotJumpAging(t *testing.T) {
+	h := newHarness(t, withMaxHTTP(1))
+	g := newRunGates(h)
+	hold := invoke(t, h, h.create(invokeJob("hold", nil)).ID)
+	waitJobRun(h, hold.JobID, hold.ID, model.StatusRunning)
+	norm := h.create(prioJob("norm", "normal"))
+	high := h.create(invokeJob("high", &model.PolicyIn{Priority: ptr("high"), MaxLateSec: ptr(int64(7 * 86400))}))
+	g.passJob(norm.ID)
+	g.passJob(high.ID)
+	rn := invoke(t, h, norm.ID)
+	h.sync()                    // parked now: its wait starts here
+	h.advance(61 * time.Second) // normal has now aged past a fresh high
+	old := pendingInvoke(high, h.clk.Now().Add(-6*24*time.Hour), nil)
+	old.ScheduledFor = h.clk.Now()
+	if err := store.InsertRun(context.Background(), h.st.W, old); err != nil {
+		t.Fatal(err)
+	}
+	h.onLoop(func() { h.e.pushRun(old) })
+	h.sync()
+	g.open(hold.ID)
+	waitCount(h, 3, model.StatusSuccess)
+	wantOrder(t, callOrder(h), hold.ID, rn.ID, old.ID)
+}
+
+func TestPendingLimitRefusesInvoke(t *testing.T) {
+	h := newHarness(t, withMaxHTTP(1))
+	newRunGates(h)
+	h.e.d.MaxPendingPerClient = 3
+	j := h.create(invokeJob("f", nil))
+	invoke(t, h, j.ID) // runs
+	h.sync()
+	for i := 0; i < 3; i++ {
+		invoke(t, h, j.ID) // pending
+	}
+	if _, err := h.e.Invoke(context.Background(), j.ID, nil, nil, nil); !errors.Is(err, ErrPendingLimit) {
+		t.Fatalf("4th pending invoke: %v, want ErrPendingLimit", err)
+	}
+	other := h.addClient("other")
+	spec := model.AdhocReq{Client: "other", Target: httpTarget()}
+	if _, err := h.e.Adhoc(context.Background(), other, spec, nil); err != nil {
+		t.Fatalf("another client must not be limited: %v", err)
+	}
 }

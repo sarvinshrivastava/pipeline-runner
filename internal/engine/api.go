@@ -401,6 +401,9 @@ func (e *Engine) Invoke(ctx context.Context, jobID string, payload json.RawMessa
 		if j.State == model.JobDisabled {
 			return ErrJobDisabled
 		}
+		if err := e.checkPendingLimit(ctx, tx, j.ClientID); err != nil {
+			return err
+		}
 		id := newID()
 		contextFor := now
 		if asOf != nil {
@@ -439,6 +442,9 @@ func (e *Engine) Adhoc(ctx context.Context, owner model.Principal, in model.Adho
 		ChainRootID: id, Status: model.StatusPending, ScheduledFor: now, OriginFor: now, ContextFor: now,
 		LatenessRef: now, AdhocSpec: &spec, Payload: in.Payload, CreatedAt: now}
 	err = e.st.Tx(ctx, func(tx *store.Tx) error {
+		if err := e.checkPendingLimit(ctx, tx, owner.ClientID); err != nil {
+			return err
+		}
 		if err := store.InsertRun(ctx, tx, r); err != nil {
 			return err
 		}
@@ -452,6 +458,23 @@ func (e *Engine) Adhoc(ctx context.Context, owner model.Principal, in model.Adho
 	}
 	e.notifyRun(ctx, r)
 	return r, nil
+}
+
+// checkPendingLimit refuses a new on-demand run once the client has
+// MaxPendingPerClient runs queued, which bounds the wait lists one client
+// can make the loop scan.
+func (e *Engine) checkPendingLimit(ctx context.Context, q store.Querier, clientID string) error {
+	if e.d.MaxPendingPerClient <= 0 {
+		return nil
+	}
+	n, err := store.CountPendingForClient(ctx, q, clientID)
+	if err != nil {
+		return err
+	}
+	if n >= e.d.MaxPendingPerClient {
+		return ErrPendingLimit
+	}
+	return nil
 }
 
 func (e *Engine) notifyRun(ctx context.Context, r model.Run) {

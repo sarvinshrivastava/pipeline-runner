@@ -256,6 +256,13 @@ func HasScheduleRunFor(ctx context.Context, q Querier, jobID string, nominal tim
 	return n > 0, err
 }
 
+// CountPendingForClient counts a client's pending runs.
+func CountPendingForClient(ctx context.Context, q Querier, clientID string) (int, error) {
+	var n int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM runs WHERE status = 'pending' AND client_id = ?`, clientID).Scan(&n)
+	return n, err
+}
+
 // DeletePendingSchedule deletes a job's pending schedule run and returns its
 // nominal instant (nil when there was none).
 func DeletePendingSchedule(ctx context.Context, q Querier, jobID string) (id string, nominal *time.Time, err error) {

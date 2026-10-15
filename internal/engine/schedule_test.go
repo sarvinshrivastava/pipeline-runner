@@ -553,3 +553,26 @@ func TestPatchCoalescesThroughAPI(t *testing.T) {
 	}
 	g.open()
 }
+
+// A rename leaves the old name's series to the reconcile sweep.
+func TestRenamedJobSeriesSwept(t *testing.T) {
+	h, _, j := queueBacklog(t, nil)
+	h.waitFor("coalesced series", func() bool {
+		for k := range coalescedSeries(t, h) {
+			if strings.HasPrefix(k, "sec|") {
+				return true
+			}
+		}
+		return false
+	})
+	if _, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Name: ptr("renamed")}); err != nil {
+		t.Fatal(err)
+	}
+	h.advance(61 * time.Second) // past reconcileEvery
+	h.sync()
+	for k := range coalescedSeries(t, h) {
+		if strings.HasPrefix(k, "sec|") {
+			t.Fatalf("old name's series survived reconcile: %v", coalescedSeries(t, h))
+		}
+	}
+}

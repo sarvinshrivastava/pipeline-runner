@@ -404,7 +404,9 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 		lateMs := late.Milliseconds()
 		won := e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusMissed, lateMs: &lateMs,
 			err: fmt.Sprintf("not dispatched within max_late_sec (%ds)", spec.Policy.MaxLateSec)})
-		if won && r.JobID != "" { // a stale row's lost finalize missed nothing
+		// A stale row's lost finalize missed nothing; a result held through a
+		// DB outage still missed.
+		if (won || e.isUnflushed(r.ID)) && r.JobID != "" {
 			e.pageCountFor(r.JobID).missed++
 		}
 		return
@@ -536,7 +538,8 @@ func (e *Engine) wakeFor(h held) {
 // parkMeta is what a parked run is ranked by, kept so a wait-list scan can
 // order and skip runs without loading them.
 type parkMeta struct {
-	latRef int64 // LatenessRef, unix ms
+	latRef int64 // LatenessRef, unix ms: a job's own queue order
+	base   int64 // when it first parked (or its due time, if later): aging starts here
 	offset int64 // priority offset, ms
 	seq    uint64
 	client string
@@ -550,7 +553,7 @@ func rankFor(list string, m parkMeta) int64 {
 	if strings.HasPrefix(list, "job:") {
 		return m.latRef
 	}
-	return m.latRef + m.offset
+	return m.base + m.offset
 }
 
 func (e *Engine) park(r model.Run, spec model.RunSpec, list string) {
@@ -558,8 +561,11 @@ func (e *Engine) park(r model.Run, spec model.RunSpec, list string) {
 		return
 	}
 	e.parkSeq++
+	latRef := r.LatenessRef.UnixMilli()
+	// Aging counts from the park, not the due time: a backdated due time (an
+	// old "at", a long-disabled job) must not buy precedence it never waited for.
 	m := parkMeta{
-		latRef: r.LatenessRef.UnixMilli(), offset: model.PriorityOffset(spec.Policy.Priority).Milliseconds(),
+		latRef: latRef, base: max(latRef, e.now().UnixMilli()), offset: model.PriorityOffset(spec.Policy.Priority).Milliseconds(),
 		seq: e.parkSeq, client: r.ClientID, http: spec.Target.Type == model.TargetHTTP,
 	}
 	e.meta[r.ID] = m
@@ -643,9 +649,14 @@ func (e *Engine) wake(list string) {
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			// Transient: unparking would orphan the run (its late-deadline
 			// entry is skipped once it leaves the list). It keeps its place;
-			// the next release or reconcile wakes the list again.
+			// the next release or reconcile retries it. A pool list goes on
+			// to the runs behind it; job and key lists keep their order.
 			e.log.Error("load parked run; leaving it parked", "run", id, "err", err)
-			return
+			if !isPool {
+				return
+			}
+			i++
+			continue
 		}
 		if err != nil || r.Status != model.StatusPending {
 			e.unpark(id)
@@ -680,14 +691,20 @@ func (e *Engine) flushMissedPages(now time.Time) {
 			delete(e.lastMissPage, jobID)
 			continue
 		}
-		if last, ok := e.lastMissPage[jobID]; ok && now.Sub(last) < missPageEvery && !now.Before(last) {
+		if last, ok := e.lastMissPage[jobID]; ok && now.Sub(last) < missPageEvery {
+			if now.Before(last) { // the clock stepped back: restart the window
+				e.lastMissPage[jobID] = now
+			}
 			continue
 		}
 		delete(e.pageBatch, jobID)
 		e.lastMissPage[jobID] = now
 		title := "coalesced"
-		if pc.missed > 0 {
+		switch {
+		case pc.missed > 0:
 			title = "missed"
+		case pc.coalesced == 0:
+			title = "expired"
 		}
 		e.pageJob(je.job, notify.Fail, title, pc.body())
 	}

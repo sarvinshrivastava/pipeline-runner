@@ -36,7 +36,7 @@ A single Go binary (`plr`) with SQLite and an embedded dashboard. Delivery 1a sh
   - A global HTTP slot pool (`MAX_HTTP_INFLIGHT`) and a per-client cap (`MAX_HTTP_INFLIGHT_PER_CLIENT`) keep one client from starving the rest. For HTTP jobs, a `concurrency_limit` above the cap is effectively the cap.
 - **Priority:**
   - `policy.priority` is `high`, `normal` (the default) or `low`. It orders runs that are waiting for a slot.
-  - Every 30 s of waiting gains a run one level, so a `low` run is never starved.
+  - Every 30 s of waiting (counted from when it started waiting) gains a run one level, so a `low` run is never starved.
   - A job's own queue (`overlap: queue`) stays first in, first out.
   - Limitation: runs due at the same instant start in arrival order while free slots remain.
 
@@ -99,7 +99,8 @@ Real values come from the secrets manager under the `PIPELINE_RUNNER_` prefix; `
 | `NTFY_BASE`, `NTFY_TOPIC_OK`, `NTFY_TOPIC_FAIL`, `NTFY_TOKEN` | | `https://ntfy.sh` | pages |
 | `HEARTBEAT_URL` | | | Uptime Kuma push URL, pinged every 60 s while the engine is healthy |
 | `MAX_HTTP_INFLIGHT` | | 64 | global HTTP callback slots |
-| `MAX_HTTP_INFLIGHT_PER_CLIENT` | | 16 | per-client share of those slots (0 = no cap) |
+| `MAX_HTTP_INFLIGHT_PER_CLIENT` | | 16 | per-client share of those slots (0 = no cap; logged as a warning) |
+| `MAX_PENDING_PER_CLIENT` | | 1000 | queued runs a client may have before invoke and ad hoc requests get `429 pending_limit` (0 = no limit) |
 | `RUN_RETENTION_DAYS` | | 60 | run history kept; sub-minute jobs keep 7 days |
 
 ## Operations
