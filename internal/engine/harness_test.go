@@ -132,6 +132,10 @@ func newHarness(t *testing.T, opts ...opt) *harness {
 		t.Fatal(err)
 	}
 	h.st = st
+	// Cleanups run LIFO: the engine stops first, then Close waits for any
+	// exec goroutine's in-flight read, then TempDir removal. Without it a
+	// late read can recreate plr.db-wal/-shm mid-removal ("directory not empty").
+	t.Cleanup(func() { _ = st.Close() })
 	h.owner = h.addClient("svc")
 	h.start()
 	return h
