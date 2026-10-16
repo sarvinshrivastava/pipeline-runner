@@ -242,6 +242,7 @@ func TestFollowResumeOffsets(t *testing.T) {
 	// Past EOF resumes at EOF: the first log event carries only new bytes.
 	s := e.follow(tok, id, "&offset=999")
 	s.next()
+	time.Sleep(200 * time.Millisecond) // well past the read at connect (poll is 10 ms)
 	appendLog(t, e, id, "X")
 	if ev := s.next(); ev.data != "X" || ev.id != "11" {
 		t.Fatalf("past EOF: %+v", ev)
@@ -784,8 +785,12 @@ func TestFollowNoDrainAfterRevokeAtFinish(t *testing.T) {
 	})
 	idA, tok := e.client("a", all...)
 	id, release := heldRun(t, e, tok)
+	appendLog(t, e, id, "before\n")
 	s := e.follow(tok, id, "")
 	s.next()
+	if ev := s.next(); ev.data != "before\n" { // the read at connect is done
+		t.Fatalf("%+v", ev)
+	}
 	appendLog(t, e, id, "secret tail")
 	if r := e.do("POST", "/v1/clients/"+idA+"/rotate", adminToken, map[string]any{}); r.status != 200 {
 		t.Fatalf("rotate: %d", r.status)
