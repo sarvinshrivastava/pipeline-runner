@@ -127,12 +127,10 @@ Real values come from the secrets manager under the `PIPELINE_RUNNER_` prefix; `
 
 ```sh
 go build ./...
-golangci-lint run ./... --build-tags bench
+golangci-lint run ./...
 go test -race ./...
 DATA_DIR=$PWD/data go run ./cmd/plr serve   # also needs the required variables above
 ```
-
-The in-process load hold runs behind the `bench` tag: `go test -tags bench -run TestLoadHold ./cmd/plr`.
 
 ## Deploy
 
