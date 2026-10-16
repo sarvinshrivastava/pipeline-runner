@@ -4,11 +4,34 @@ name: deploy
 # trigger a live deploy.
 on:
   workflow_dispatch:
+    inputs:
+      rollback_sha:
+        description: "Roll back to a previously deployed image (short git SHA). Leave empty to deploy main."
+        required: false
+        default: ""
+
+permissions: {}
+
+# A deploy and a rollback must never run on the box at the same time.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate input
+        env:
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+        shell: bash
+        run: |
+          # Whole-string match: grep would accept a value with a newline in it.
+          if [ -n "$ROLLBACK_SHA" ] && ! [[ "$ROLLBACK_SHA" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "rollback_sha must be a hex git SHA" >&2
+            exit 1
+          fi
+
       - name: Fetch VPS credentials from the secrets manager
         id: creds
         run: |
@@ -27,17 +50,46 @@ jobs:
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
         with:
           host: ${{ steps.creds.outputs.host }}
           username: root
           key: ${{ steps.creds.outputs.key }}
+          envs: ROLLBACK_SHA
           script: |
             set -euo pipefail
             REPO_NAME=$(basename "${{ github.repository }}")
             APP_DIR="/root/apps/$REPO_NAME"
+
+            # The container runs as uid 10001 and needs its data dir.
+            DATA_DIR=$(grep -s '^HOST_DATA_DIR=' "$APP_DIR/.env" | cut -d= -f2- || true)
+            DATA_DIR="${DATA_DIR:-/root/pipeline-runner-data}"
+            install -d -o 10001 -g 10001 -m 700 "$DATA_DIR"
+            chown -R 10001:10001 "$DATA_DIR"
+
+            if [ -n "${ROLLBACK_SHA:-}" ]; then
+              # Rollback: no pull, no rebuild. A binary older than the database
+              # schema refuses to start; roll forward in that case. Tags are
+              # short SHAs, so resolve whatever length was given.
+              TAG=$(git -C "$APP_DIR" rev-parse --short "$ROLLBACK_SHA")
+              docker image inspect "pipeline-runner:$TAG" >/dev/null
+              docker tag "pipeline-runner:$TAG" pipeline-runner:latest
+              docker compose -f "$APP_DIR/docker-compose.yml" up -d --no-build
+              echo "Rolled back to $TAG"
+              exit 0
+            fi
+
             if [ ! -d "$APP_DIR/.git" ]; then
               git clone "${{ github.server_url }}/${{ github.repository }}.git" "$APP_DIR"
             else
               git -C "$APP_DIR" pull origin main
             fi
+            # Stamps the binary's version (compose passes it as a build arg).
+            export GIT_SHA=$(git -C "$APP_DIR" rev-parse --short HEAD)
             vps-deploy "$REPO_NAME" "$APP_DIR"
+            docker tag pipeline-runner:latest "pipeline-runner:$GIT_SHA"
+            # Keep the five newest SHA tags for rollback.
+            docker images pipeline-runner --format '{{.CreatedAt}}|{{.Tag}}' \
+              | grep -v '|latest$' | sort -r | awk -F'|' 'NR>5 {print $2}' \
+              | xargs -r -I{} docker rmi "pipeline-runner:{}" || true

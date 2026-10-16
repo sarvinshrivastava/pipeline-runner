@@ -1,0 +1,595 @@
+openapi: 3.1.0
+info:
+  title: pipeline-runner
+  version: "1"
+  description: |
+    The central time service. A job is a trigger (cron, at, delay, invoke) plus a target (an HTTP
+    callback to your service, or a container/inline script) plus a policy. Runs are fired at their
+    instant; past max_late_sec they are marked missed and paged, never run late.
+
+    Callback contract (HTTP targets):
+    - Requests carry X-PLR-Run-Id, X-PLR-Job, X-PLR-Attempt, X-PLR-Trigger, X-PLR-Scheduled-For and a
+      JSON body {run_id, job, attempt, trigger, scheduled_for, payload}.
+    - Delivery is at-least-once by default: receivers MUST dedupe on X-PLR-Run-Id.
+    - Answer 2xx for done, 2xx {"defer_until": RFC3339} to be called again later, 429/503 with
+      Retry-After to defer, other 4xx to fail without retry, 5xx to fail (retried per policy).
+    - Async mode: answer 202 and later call POST /v1/runs/{id}/complete with the X-PLR-Run-Token you
+      received (and heartbeat to extend the lease). If you receive a duplicate X-PLR-Run-Id for work
+      still in progress, answer 202 again (not 200). Retry complete with backoff for at least 10
+      minutes if the runner is unreachable.
+servers:
+  - url: /
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+    runToken:
+      type: apiKey
+      in: header
+      name: X-PLR-Run-Token
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    wait:
+      name: wait
+      in: query
+      description: Block up to this many seconds (1..55, e.g. 30 or 30s) for the run chain to finish.
+      schema: {type: string, pattern: '^\d{1,2}s?$'}
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Same key + same body replays the response stored when the write committed (for invoke and ad-hoc runs, the 202 with the run as accepted; ?wait is not replayed). A different body is 409. Kept 24 h.
+      schema: {type: string, maxLength: 128}
+    cursor:
+      name: cursor
+      in: query
+      schema: {type: string}
+    limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 100}
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            field: {type: string}
+            status: {type: string, description: The run's status, for run conflicts.}
+    Trigger:
+      type: object
+      required: [type]
+      properties:
+        type: {type: string, enum: [cron, at, delay, invoke]}
+        cron: {type: string, description: 5 fields, or 6 with seconds (http targets only).}
+        timezone: {type: string, description: IANA zone, default UTC.}
+        at: {type: string, format: date-time}
+        delay_sec: {type: integer, minimum: 0}
+    Policy:
+      type: object
+      properties:
+        timeout_sec: {type: integer, default: 900}
+        max_late_sec: {type: integer, default: 600}
+        late_warn_sec: {type: integer, default: 60}
+        jitter_sec: {type: integer, default: 0}
+        delivery: {type: string, enum: [at_least_once, at_most_once]}
+        retry:
+          type: object
+          properties:
+            max_attempts: {type: integer, default: 1}
+            backoff_sec: {type: integer, default: 30}
+            max_backoff_sec: {type: integer, default: 3600}
+        concurrency_key: {type: string}
+        concurrency_limit: {type: integer, description: "For http targets also bounded by the runner's per-client slot cap (MAX_HTTP_INFLIGHT_PER_CLIENT, default 4)."}
+        overlap: {type: string, enum: [skip, queue, allow]}
+        max_defer_sec: {type: integer, default: 86400}
+        notify_on_success: {type: boolean}
+        priority:
+          type: string
+          enum: [high, normal, low]
+          default: normal
+          description: Orders runs waiting for a slot. A run gains one level for every 30 s it waits, so low never starves. Runs due at the same instant start in arrival order while slots are free. A PATCH that sends policy replaces it whole, so resend priority.
+    HTTPTarget:
+      type: object
+      required: [url]
+      properties:
+        method: {type: string, enum: [GET, POST, PUT, PATCH, DELETE]}
+        url: {type: string, description: Host must be in the client's callback_hosts.}
+        headers: {type: object, additionalProperties: {type: string}}
+        body: {description: Static JSON payload when an invoke sends none.}
+        mode: {type: string, enum: [sync, async]}
+        lease_sec: {type: integer}
+        auth:
+          type: object
+          properties:
+            bearer_ref: {type: string, description: Vault reference Folder/KEY sent as Authorization Bearer.}
+            hmac_ref: {type: string, description: "Vault reference of an HMAC key. The callback then carries X-PLR-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(key, t + '.' + raw request body)>. GET callbacks sign an empty body. Receivers should compare in constant time and reject a t older than a few minutes."}
+    Target:
+      type: object
+      required: [type]
+      properties:
+        type: {type: string, enum: [http, container, inline]}
+        http: {$ref: '#/components/schemas/HTTPTarget'}
+        container: {type: object}
+        inline: {type: object}
+    JobCreate:
+      type: object
+      required: [name, trigger, target]
+      properties:
+        client: {type: string, description: Admin token only - the owning client's name.}
+        name: {type: string}
+        trigger: {$ref: '#/components/schemas/Trigger'}
+        target: {$ref: '#/components/schemas/Target'}
+        policy: {$ref: '#/components/schemas/Policy'}
+        enabled: {type: boolean}
+    JobPatch:
+      type: object
+      properties:
+        name: {type: string}
+        trigger: {$ref: '#/components/schemas/Trigger'}
+        target: {$ref: '#/components/schemas/Target'}
+        policy: {$ref: '#/components/schemas/Policy'}
+    Job:
+      type: object
+      properties:
+        id: {type: string}
+        client_id: {type: string}
+        name: {type: string}
+        state: {type: string, enum: [active, disabled, done]}
+        trigger: {$ref: '#/components/schemas/Trigger'}
+        target: {type: object, description: As created; container and inline env values are never returned, only their names as env_keys.}
+        policy: {$ref: '#/components/schemas/Policy'}
+        rev: {type: integer}
+        next_fires: {type: array, items: {type: string, format: date-time}}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Run:
+      type: object
+      properties:
+        id: {type: string}
+        job_id: {type: string}
+        job_name: {type: string}
+        client_id: {type: string}
+        trigger: {type: string, enum: [schedule, invoke, retry, defer, adhoc]}
+        attempt: {type: integer}
+        parent_run_id: {type: string}
+        chain_root_id: {type: string}
+        status: {type: string, enum: [pending, running, waiting, success, failed, timeout, missed, skipped, interrupted, cancelled, deferred]}
+        nominal_for: {type: string, format: date-time}
+        scheduled_for: {type: string, format: date-time}
+        context_for: {type: string, format: date-time}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        lease_expires_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        late_ms: {type: integer}
+        http_status: {type: integer}
+        exit_code: {type: integer}
+        payload: {}
+        output: {}
+        output_truncated: {type: boolean}
+        output_error: {type: string}
+        error: {type: string}
+    Client:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        scopes: {type: array, items: {type: string, enum: [admin, "jobs:read", "jobs:write", "runs:invoke", "runs:adhoc"]}}
+        callback_hosts: {type: array, items: {type: string}}
+        secret_ref_prefixes: {type: array, items: {type: string}}
+        repo_prefixes: {type: array, items: {type: string}}
+        container_allowed: {type: boolean}
+        root_allowed: {type: boolean}
+        ntfy_topic: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    ClientIn:
+      type: object
+      properties:
+        name: {type: string}
+        scopes: {type: array, items: {type: string}}
+        callback_hosts: {type: array, items: {type: string}}
+        secret_ref_prefixes: {type: array, items: {type: string}}
+        repo_prefixes: {type: array, items: {type: string}}
+        container_allowed: {type: boolean}
+        root_allowed: {type: boolean}
+        ntfy_topic: {type: string}
+    Report:
+      type: object
+      properties:
+        ok: {type: boolean}
+        checks: {type: array, items: {type: object, properties: {name: {type: string}, ok: {type: boolean}, detail: {type: string}}}}
+        next_fires: {type: array, items: {type: string, format: date-time}}
+paths:
+  /healthz:
+    get:
+      operationId: healthz
+      security: []
+      responses:
+        "200": {description: Engine loop alive}
+        "503": {description: Engine loop stalled for 60 s}
+  /v1/openapi.json:
+    get:
+      operationId: openapi
+      security: []
+      responses:
+        "200": {description: This document}
+  /v1/status:
+    get:
+      operationId: status
+      responses:
+        "200": {description: Engine, vault and docker state}
+        "401": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/jobs:
+    get:
+      operationId: listJobs
+      parameters:
+        - {$ref: '#/components/parameters/cursor'}
+        - {$ref: '#/components/parameters/limit'}
+        - {name: client, in: query, schema: {type: string}, description: Admin only.}
+      responses:
+        "200": {description: A page of jobs}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+    post:
+      operationId: createJob
+      parameters: [{$ref: '#/components/parameters/idempotencyKey'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/JobCreate'}}}
+      responses:
+        "201": {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+  /v1/jobs/validate:
+    post:
+      operationId: validateNewJob
+      description: Dry run of createJob; nothing is stored.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/JobCreate'}}}
+      responses:
+        "200": {description: Report, content: {application/json: {schema: {$ref: '#/components/schemas/Report'}}}}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: getJob
+      responses:
+        "200": {description: The job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+    patch:
+      operationId: patchJob
+      description: Replaces whichever of trigger, target, policy, name are present. An absent target.env keeps the stored env.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/JobPatch'}}}
+      responses:
+        "200": {description: Updated}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: deleteJob
+      description: Cancels the job's pending, waiting and running runs; run history is kept.
+      responses:
+        "204": {description: Deleted}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/invoke:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: invokeJob
+      parameters:
+        - {$ref: '#/components/parameters/wait'}
+        - {$ref: '#/components/parameters/idempotencyKey'}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                payload: {description: Any JSON, at most 256 KiB.}
+                as_of: {type: string, format: date-time, description: Sets X-PLR-Scheduled-For / PLR_SCHEDULED_FOR (backfill).}
+      responses:
+        "200": {description: Finished within wait, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
+        "202": {description: "Accepted (poll GET /v1/runs/{id})", content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/enable:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: enableJob
+      responses:
+        "200": {description: Enabled}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/disable:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: disableJob
+      responses:
+        "200": {description: Disabled; pending runs cancelled}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/validate:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: validateJob
+      responses:
+        "200": {description: Report, content: {application/json: {schema: {$ref: '#/components/schemas/Report'}}}}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/runs:
+    get:
+      operationId: listRuns
+      parameters:
+        - {$ref: '#/components/parameters/cursor'}
+        - {$ref: '#/components/parameters/limit'}
+        - {name: job, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string}}
+      responses:
+        "200": {description: A page of runs}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+    post:
+      operationId: createAdhocRun
+      description: Run a target once without creating a job. Needs the runs:adhoc scope.
+      parameters:
+        - {$ref: '#/components/parameters/wait'}
+        - {$ref: '#/components/parameters/idempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                client: {type: string}
+                target: {$ref: '#/components/schemas/Target'}
+                policy: {$ref: '#/components/schemas/Policy'}
+                payload: {}
+      responses:
+        "200": {description: Finished within wait}
+        "202": {description: Accepted}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+  /v1/runs/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: getRun
+      responses:
+        "200": {description: The run, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/runs/{id}/logs:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: getRunLogs
+      description: |
+        Without follow, the log so far as plain text (up to 16 MiB). With follow=1, a live
+        Server-Sent Events stream instead of polling:
+          - event "status": {"status"} on connect and on every change.
+          - event "log": new log bytes; "id" is the byte offset after them. Line ends arrive
+            as \n; the id counts raw file bytes. A resume beyond 16 MiB behind starts with a
+            "[N bytes skipped]" chunk.
+          - event "end": {"status", "reason", "successor_run_id"?}, then the server closes.
+            reason is finished | timeout (after 1 h) | shutdown | unauthorized | deleted |
+            truncated | error. finished, timeout and shutdown send the remaining bytes first.
+            successor_run_id names a retry or defer that continues the run.
+          - a ": ping" comment every 15 s.
+        Resume with the Last-Event-ID header (it wins over ?offset=). At most 4 streams per
+        client and 128 in total (429 too_many_streams). The token is re-checked every 60 s.
+        A late completion note on an interrupted run is not streamed.
+      parameters:
+        - {name: follow, in: query, schema: {type: string, enum: ["0", "1", "true", "false"]}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0}}
+        - {name: Last-Event-ID, in: header, schema: {type: string}}
+      responses:
+        "200": {description: "Plain-text log (container output, or a request/response summary for HTTP runs), or with follow=1 an event stream", content: {text/plain: {}, text/event-stream: {}}}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/runs/{id}/cancel:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: cancelRun
+      responses:
+        "200": {description: A pending or waiting run was cancelled}
+        "202": {description: A running run is being cancelled (repeatable)}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "409": {description: "The run is already terminal (error.status holds its status)", content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/runs/{id}/heartbeat:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: heartbeatRun
+      security: [{runToken: []}]
+      responses:
+        "200": {description: Lease extended (capped at the run's timeout)}
+        "401": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/runs/{id}/complete:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: completeRun
+      security: [{runToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: {type: string, enum: [success, failed]}
+                output: {description: JSON, at most 64 KiB.}
+                error: {type: string, maxLength: 4096}
+      responses:
+        "200": {description: Recorded}
+        "202": {description: Recorded before the runner saw your 202; applied when it does}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/clients:
+    get:
+      operationId: listClients
+      responses:
+        "200": {description: Clients}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+    post:
+      operationId: createClient
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ClientIn'}}}
+      responses:
+        "201": {description: Created; the token is shown once}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "409": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+  /v1/clients/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    patch:
+      operationId: patchClient
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ClientIn'}}}
+      responses:
+        "200": {description: Updated}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: deleteClient
+      responses:
+        "204": {description: Deleted}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "409": {description: The client still owns jobs, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+  /v1/clients/{id}/rotate:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: rotateClient
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grace_sec: {type: integer, minimum: 0, maximum: 3600, description: How long the old token keeps working.}
+      responses:
+        "200": {description: New token (shown once)}
+        "400": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "404": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "413": {$ref: '#/components/responses/Error'}
+  /v1/secrets:
+    get:
+      operationId: listSecrets
+      description: Secret names (never values) under the caller's secret_ref_prefixes.
+      responses:
+        "200": {description: Names}
+        "401": {$ref: '#/components/responses/Error'}
+        "403": {$ref: '#/components/responses/Error'}
+        "503": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/Error'}

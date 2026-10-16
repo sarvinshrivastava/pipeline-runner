@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pipeline Runner</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Pipeline Runner</h1>
+    <div class="header-actions">
+      <span id="health" class="pill pill-muted" role="status">checking…</span>
+      <button id="signout-btn" class="btn btn-ghost" type="button" hidden>Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="auth-gate" hidden>
+      <div class="card narrow">
+        <h2>API token</h2>
+        <p class="muted">Kept in this tab only (sessionStorage) and sent as a bearer token.</p>
+        <form id="token-form">
+          <label for="token-input" class="sr-only">API token</label>
+          <input id="token-input" type="password" placeholder="API token" autocomplete="current-password" required>
+          <button class="btn btn-primary" type="submit">Continue</button>
+        </form>
+        <p id="token-error" class="error" role="alert" hidden></p>
+      </div>
+    </section>
+
+    <section id="app" hidden>
+      <nav class="tabs" role="tablist">
+        <button class="btn" type="button" role="tab" aria-controls="tab-jobs" data-tab="jobs" aria-selected="true">Jobs</button>
+        <button class="btn" type="button" role="tab" aria-controls="tab-runs" data-tab="runs" aria-selected="false">Runs</button>
+        <button class="btn" type="button" role="tab" aria-controls="tab-clients" data-tab="clients" aria-selected="false">Clients</button>
+      </nav>
+
+      <div id="tab-jobs" role="tabpanel">
+        <div class="card">
+          <div class="card-head">
+            <h2>Jobs</h2>
+            <button id="new-job-btn" class="btn btn-primary" type="button">New job</button>
+          </div>
+          <div id="jobs"></div>
+        </div>
+      </div>
+
+      <div id="tab-runs" role="tabpanel" hidden>
+        <div class="card">
+          <div class="card-head">
+            <h2>Runs</h2>
+            <div class="row-actions">
+              <select id="run-job-filter" aria-label="Filter by job"><option value="">All jobs</option></select>
+              <select id="run-status-filter" aria-label="Filter by status">
+                <option value="">All statuses</option>
+                <option>pending</option><option>running</option><option>waiting</option><option>success</option>
+                <option>failed</option><option>timeout</option><option>missed</option><option>skipped</option>
+                <option>interrupted</option><option>cancelled</option><option>deferred</option>
+              </select>
+            </div>
+          </div>
+          <div id="runs" class="table-wrap"></div>
+        </div>
+      </div>
+
+      <div id="tab-clients" role="tabpanel" hidden>
+        <div class="card">
+          <div class="card-head">
+            <h2>Clients</h2>
+            <button id="new-client-btn" class="btn btn-primary" type="button">New client</button>
+          </div>
+          <div id="clients" class="table-wrap"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="job-dialog" aria-labelledby="job-dialog-title">
+    <h2 id="job-dialog-title">New job</h2>
+    <p class="muted">The JSON body of POST /v1/jobs (the admin token must set "client").</p>
+    <textarea id="job-json" class="json-input-tall" aria-label="Job JSON" spellcheck="false"></textarea>
+    <pre id="job-report" class="code-block" hidden></pre>
+    <div class="actions">
+      <button id="job-cancel" class="btn" type="button">Close</button>
+      <button id="job-validate" class="btn" type="button">Validate</button>
+      <button id="job-save" class="btn btn-primary" type="button">Create</button>
+    </div>
+  </dialog>
+
+  <dialog id="client-dialog" aria-labelledby="client-dialog-title">
+    <h2 id="client-dialog-title">New client</h2>
+    <p class="muted">The JSON body of POST /v1/clients. The token is shown once.</p>
+    <textarea id="client-json" class="json-input" aria-label="Client JSON" spellcheck="false"></textarea>
+    <pre id="client-report" class="code-block token-once" hidden></pre>
+    <div class="actions">
+      <button id="client-cancel" class="btn" type="button">Close</button>
+      <button id="client-save" class="btn btn-primary" type="button">Create</button>
+    </div>
+  </dialog>
+
+  <dialog id="run-dialog" aria-labelledby="run-title">
+    <div class="log-head">
+      <h2 id="run-title">Run</h2>
+      <button id="run-close" class="btn btn-sm" type="button">Close</button>
+    </div>
+    <pre id="run-json" class="code-block"></pre>
+    <h2>Log</h2>
+    <pre id="log-body" class="code-block code-block-log"></pre>
+  </dialog>
+</body>
+</html>
