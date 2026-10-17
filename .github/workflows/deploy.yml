@@ -76,8 +76,15 @@ jobs:
             APP_DIR="/root/apps/$REPO_NAME"
 
             # The container runs as uid 10001 and needs its data dir.
-            DATA_DIR=$(grep -s '^HOST_DATA_DIR=' "$APP_DIR/.env" | cut -d= -f2- || true)
+            # .env values may be quoted (HOST_DATA_DIR="/root/…"); compose strips
+            # the quotes, so strip them here too or the chown hits a stray
+            # relative path while compose mounts the real one.
+            DATA_DIR=$(grep -s '^HOST_DATA_DIR=' "$APP_DIR/.env" | tail -n1 | cut -d= -f2- | tr -d "\"'" || true)
             DATA_DIR="${DATA_DIR:-/root/pipeline-runner-data}"
+            case "$DATA_DIR" in
+              /*) ;;
+              *) echo "HOST_DATA_DIR must be an absolute path, got: $DATA_DIR" >&2; exit 1 ;;
+            esac
             install -d -o 10001 -g 10001 -m 700 "$DATA_DIR"
             chown -R 10001:10001 "$DATA_DIR"
 
