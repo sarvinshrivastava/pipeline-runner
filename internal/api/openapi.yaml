@@ -105,6 +105,8 @@ components:
           enum: [high, normal, low]
           default: normal
           description: Orders runs waiting for a slot. A run gains one level for every 30 s it waits, so low never starves. Runs due at the same instant start in arrival order while slots are free. A PATCH that sends policy replaces it whole, so resend priority.
+        push_url_ref: {type: string, description: "Vault ref (Folder/KEY) whose value is an Uptime Kuma push URL. After each successful run the runner pings it with status=up; after a final failure with status=down unless push_on_failure is false. The host must be in the runner's PUSH_URL_HOSTS. Refused on ad-hoc runs and on one-shot (at/delay) jobs. A PATCH that sends policy but omits this field keeps it; send \"\" to clear it."}
+        push_on_failure: {type: boolean, default: true, description: "Also push status=down after a final failure. Kept when a policy PATCH omits it. Ignored on ad-hoc runs."}
     HTTPTarget:
       type: object
       required: [url]

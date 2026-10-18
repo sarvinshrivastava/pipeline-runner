@@ -56,6 +56,8 @@ type PolicyIn struct {
 	MaxDeferSec      *int64   `json:"max_defer_sec,omitempty"`
 	NotifyOnSuccess  *bool    `json:"notify_on_success,omitempty"`
 	Priority         *string  `json:"priority,omitempty"`
+	PushURLRef       *string  `json:"push_url_ref,omitempty"`
+	PushOnFailure    *bool    `json:"push_on_failure,omitempty"`
 }
 
 // HTTPIn is an HTTP target as sent.
@@ -182,6 +184,9 @@ func ValidateJobCreate(in JobCreate, c VCtx) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
+	if err := checkPush(&policy, trig, c.Principal); err != nil {
+		return Job{}, err
+	}
 	state := JobActive
 	if in.Enabled != nil && !*in.Enabled {
 		state = JobDisabled
@@ -211,10 +216,22 @@ func ValidatePatch(cur Job, in JobPatch, c VCtx) (next Job, triggerChanged bool,
 	if in.Trigger != nil {
 		trigType = in.Trigger.Type
 	}
-	if in.Policy != nil || in.Target != nil || in.Trigger != nil {
+	recomputed := in.Policy != nil || in.Target != nil || in.Trigger != nil
+	if recomputed {
 		// A new trigger or target can change policy defaults (overlap).
 		pin := in.Policy
-		if pin == nil {
+		if pin != nil {
+			// A policy PATCH is whole-replace, except that omitted push fields
+			// are kept; an explicit "" clears the ref.
+			cp := *pin
+			if cp.PushURLRef == nil {
+				cp.PushURLRef = &cur.Policy.PushURLRef
+			}
+			if cp.PushOnFailure == nil {
+				cp.PushOnFailure = &cur.Policy.PushOnFailure
+			}
+			pin = &cp
+		} else {
 			pin = policyAsInput(cur.Policy)
 			// An overlap still at the old default follows the new default.
 			if cur.Policy.Overlap == DefaultPolicy(cur.Trigger.Type, cur.Target).Overlap {
@@ -238,6 +255,12 @@ func ValidatePatch(cur Job, in JobPatch, c VCtx) (next Job, triggerChanged bool,
 	} else if next.Trigger.Type == TriggerAt && next.Policy.JitterSec >= next.Policy.MaxLateSec {
 		return Job{}, false, fieldErr("policy.jitter_sec", "invalid", "must be less than max_late_sec")
 	}
+	if recomputed {
+		// Re-check a kept ref against the current prefixes and trigger.
+		if err = checkPush(&next.Policy, next.Trigger, c.Principal); err != nil {
+			return Job{}, false, err
+		}
+	}
 	next.NSKey = NSKey(cur.ClientID, next.Policy.ConcurrencyKey)
 	return next, triggerChanged, nil
 }
@@ -252,7 +275,39 @@ func ValidateAdhoc(in AdhocReq, c VCtx) (RunSpec, error) {
 	if err != nil {
 		return RunSpec{}, err
 	}
+	if policy.PushURLRef != "" {
+		return RunSpec{}, fieldErr("policy.push_url_ref", "invalid", "push_url_ref needs a job; ad-hoc runs have none")
+	}
+	// Ignored here, so a policy copied from a job's GET still validates.
+	policy.PushOnFailure = true
 	return RunSpec{Target: target, Policy: policy}, nil
+}
+
+// checkPush validates a policy's push_url_ref once the trigger is known and
+// stores its canonical form.
+func checkPush(p *Policy, trig Trigger, pr Principal) error {
+	if p.PushURLRef == "" {
+		return nil
+	}
+	if trig.Type == TriggerAt {
+		return fieldErr("policy.push_url_ref", "invalid", "push_url_ref needs a recurring job (cron or invoke); a one-shot job finishes and its monitor would stay down")
+	}
+	ref, err := checkRef(p.PushURLRef, pr)
+	if err != nil {
+		return withField(err, "policy.push_url_ref")
+	}
+	p.PushURLRef = ref
+	return nil
+}
+
+// PolicyRefs lists the vault references a job's policy uses. They are
+// checked at write time only: RunSpec.Refs leaves them out, so a vault
+// problem with the push ref never fails a run.
+func (p Policy) PolicyRefs() []string {
+	if p.PushURLRef == "" {
+		return nil
+	}
+	return []string{p.PushURLRef}
 }
 
 // NSKey namespaces a concurrency key by client.
@@ -348,7 +403,7 @@ func DefaultPolicy(trigType string, t Target) Policy {
 	return Policy{
 		TimeoutSec: 900, MaxLateSec: 600, LateWarnSec: 60, Delivery: AtLeastOnce,
 		Retry:   RetryPolicy{MaxAttempts: 1, BackoffSec: 30, MaxBackoffSec: 3600},
-		Overlap: overlap, MaxDeferSec: 86400, Priority: PriorityNormal,
+		Overlap: overlap, MaxDeferSec: 86400, Priority: PriorityNormal, PushOnFailure: true,
 	}
 }
 
@@ -443,6 +498,12 @@ func validatePolicy(in *PolicyIn, trigType string, t Target) (Policy, error) {
 			return Policy{}, fieldErr("policy.priority", "invalid", "must be high, normal or low")
 		}
 	}
+	if in.PushURLRef != nil {
+		p.PushURLRef = strings.TrimSpace(*in.PushURLRef)
+	}
+	if in.PushOnFailure != nil {
+		p.PushOnFailure = *in.PushOnFailure
+	}
 	return p, nil
 }
 
@@ -452,6 +513,7 @@ func policyAsInput(p Policy) *PolicyIn {
 		TimeoutSec: &p.TimeoutSec, MaxLateSec: &p.MaxLateSec, LateWarnSec: &p.LateWarnSec, JitterSec: &p.JitterSec,
 		Delivery: &p.Delivery, Retry: &RetryIn{MaxAttempts: &r.MaxAttempts, BackoffSec: &r.BackoffSec, MaxBackoffSec: &r.MaxBackoffSec},
 		Overlap: &p.Overlap, MaxDeferSec: &p.MaxDeferSec, NotifyOnSuccess: &p.NotifyOnSuccess,
+		PushURLRef: &p.PushURLRef, PushOnFailure: &p.PushOnFailure,
 	}
 	if p.ConcurrencyKey != "" {
 		in.ConcurrencyKey, in.ConcurrencyLimit = &p.ConcurrencyKey, &p.ConcurrencyLimit

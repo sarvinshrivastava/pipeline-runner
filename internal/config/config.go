@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -39,6 +40,8 @@ type Config struct {
 	NtfyToken     string
 	DashboardURL  string
 	HeartbeatURL  string
+	// PushURLHosts are the hosts a job's push_url_ref may point at (Uptime Kuma).
+	PushURLHosts []string
 
 	TrustedProxies []netip.Prefix
 
@@ -86,6 +89,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		NtfyToken:     r.str("NTFY_TOKEN", ""),
 		DashboardURL:  strings.TrimRight(r.str("DASHBOARD_URL", ""), "/"),
 		HeartbeatURL:  r.str("HEARTBEAT_URL", ""),
+		PushURLHosts:  r.hosts("PUSH_URL_HOSTS"),
 
 		TrustedProxies: r.trustedProxies(),
 
@@ -168,6 +172,23 @@ func (r *reader) list(name, fallback string) []string {
 	for _, p := range strings.Split(r.str(name, fallback), ",") {
 		if p = strings.ToLower(strings.TrimSpace(p)); p != "" {
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+var hostLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// hosts reads a comma-separated list of bare hostnames: no scheme, port,
+// path or wildcard.
+func (r *reader) hosts(name string) []string {
+	out := r.list(name, "")
+	for _, h := range out {
+		for _, label := range strings.Split(h, ".") {
+			if !hostLabel.MatchString(label) {
+				r.errs = append(r.errs, fmt.Errorf("%s: %q is not a bare hostname", name, h))
+				break
+			}
 		}
 	}
 	return out

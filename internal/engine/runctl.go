@@ -366,7 +366,10 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 	case v.deleted || errors.Is(err, store.ErrNotFound):
 		// A create event can arrive after the job was already deleted.
 		if je := e.jobs[v.jobID]; je != nil && e.d.Metrics != nil {
-			e.d.Metrics.DeleteCoalesced(je.job.Name, je.job.ClientID)
+			e.d.Metrics.DeleteJobSeries(je.job.Name, je.job.ClientID)
+		}
+		if e.d.Pusher != nil {
+			e.d.Pusher.Forget(v.jobID)
 		}
 		delete(e.jobs, v.jobID)
 		delete(e.pageBatch, v.jobID)

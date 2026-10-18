@@ -109,10 +109,29 @@ Real values come from the secrets manager under the `PIPELINE_RUNNER_` prefix; `
 | `SECRET_MANAGER_URL`, `SECRET_MANAGER_TOKEN` | yes | | vault read access |
 | `NTFY_BASE`, `NTFY_TOPIC_OK`, `NTFY_TOPIC_FAIL`, `NTFY_TOKEN` | | `https://ntfy.sh` | pages |
 | `HEARTBEAT_URL` | | | Uptime Kuma push URL, pinged every 60 s while the engine is healthy |
+| `PUSH_URL_HOSTS` | | | Hosts a job's `push_url_ref` may point at (Uptime Kuma). Empty: job pushes are refused. |
 | `MAX_HTTP_INFLIGHT` | | 64 | global HTTP callback slots |
 | `MAX_HTTP_INFLIGHT_PER_CLIENT` | | 4 | per-client share of those slots (0 = no cap; logged as a warning) |
 | `MAX_PENDING_PER_CLIENT` | | 1000 | invoke and ad hoc runs (with their retries and defers) a client may have pending, running or waiting before further requests get `429 pending_limit` (0 = no limit) |
 | `RUN_RETENTION_DAYS` | | 60 | run history kept; sub-minute jobs keep 7 days |
+
+## Kuma push per job
+
+A cron or invoke job can ping its own Uptime Kuma Push monitor, so a job that stops running alerts even when nothing pages.
+
+1. In Kuma, create a monitor of type **Push** and copy its push URL.
+2. Store the URL in the vault under the client's prefix, for example `Root/<CLIENT>_KUMA_<JOB>`.
+3. Set `PUSH_URL_HOSTS` to the Kuma host (`status.example.com`, or the docker service name `uptime-kuma`).
+4. Add the ref to the job's policy. GET the job, take its `policy` object unchanged, add `"push_url_ref": "<ref>"`, and PATCH `{"policy": <that whole object>}`. Never PATCH a policy with only `push_url_ref`: the other policy fields are replaced whole and would reset to their defaults.
+
+What is sent:
+
+- After a successful run: `status=up`, with the run duration as `ping`.
+- After a final failure (`failed`, `timeout` or `interrupted`, no retry left): `status=down`, with the status word as `msg`. Set `push_on_failure: false` to send only the up pings.
+- Missed, skipped and cancelled runs send nothing. Disabling a job stops new runs, so it stops pushing; a run already in flight still reports its result. Pause the monitor in Kuma when you disable the job. One-shot (`at`/`delay`) jobs and ad-hoc runs cannot have a push.
+- `POST /v1/jobs/{id}/validate` checks the ref, the URL rules and the host's address. The URL itself is never logged or returned.
+
+Pushes are best-effort: one GET (3 s HTTP timeout) inside a 5 s per-push budget that also covers the client lookup and the vault read, no retry, and a repeat of the same state to the same ref within 20 s is dropped. Pointing the job at a new ref takes effect on the next ping (a ping already queued still goes to the monitor of the run it belongs to, the old ref); changing the vault value behind the same ref does not reset that 20 s window, so one same-state ping inside it may be skipped and the next one goes through. Set the monitor's heartbeat interval to at least: the schedule period (for an invoke job, the caller's cadence) + `jitter_sec` + `timeout_sec × max_attempts` + the sum of retry backoffs (each capped at `max_backoff_sec`) + 20 s, plus one more period if a single lost ping should not alert. For a job that runs more often than every 20 s, use at least 60 s. A daily job with no retries needs about 25 h.
 
 ## Operations
 

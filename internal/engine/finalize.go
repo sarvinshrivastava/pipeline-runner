@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/schedule"
@@ -36,6 +37,7 @@ type outcome struct {
 	successor       *model.Run
 	page            bool
 	pageTitle       string
+	finishedAt      time.Time // set by finalize; afterFinalize may run later (unflushed replay)
 }
 
 func newID() string {
@@ -119,6 +121,7 @@ func truncate(s string, n int) string {
 // guarded transition loses, nothing else happens. It returns whether it won.
 func (e *Engine) finalize(r model.Run, from []model.Status, o outcome) bool {
 	now := e.now()
+	o.finishedAt = now
 	var je *jobEntry
 	if r.JobID != "" {
 		je = e.jobs[r.JobID]
@@ -225,6 +228,10 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 	r.Status = o.status
 	r.Error = o.err
 
+	// The run's end is finalize's clock, not now: an unflushed replay can run
+	// afterFinalize long after the run finished.
+	finished := o.finishedAt
+
 	je := e.jobs[r.JobID]
 	if je != nil {
 		if jobDone {
@@ -243,7 +250,7 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 	if m := e.d.Metrics; m != nil {
 		m.RunsTotal.WithLabelValues(r.JobName, r.ClientID, string(o.status)).Inc()
 		if r.StartedAt != nil {
-			m.RunDuration.WithLabelValues(r.JobName, r.ClientID).Observe(e.now().Sub(*r.StartedAt).Seconds())
+			m.RunDuration.WithLabelValues(r.JobName, r.ClientID).Observe(finished.Sub(*r.StartedAt).Seconds())
 		}
 		if o.status == model.StatusSkipped {
 			m.SkippedTotal.WithLabelValues(r.JobName).Inc()
@@ -255,6 +262,24 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		e.page(r, notify.Fail, o.pageTitle, o.err)
 	case o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && je.job.Policy.NotifyOnSuccess:
 		e.page(r, notify.OK, "succeeded", "Run "+r.ID+" succeeded.")
+	}
+	if je != nil && e.d.Pusher != nil && je.job.Policy.PushURLRef != "" {
+		// The current policy, not the run's revision: the ref names an
+		// operator monitor, so a change applies from the next terminal write.
+		pol := je.job.Policy
+		x := jobpush.Push{JobID: je.job.ID, JobName: r.JobName, ClientID: r.ClientID, RunID: r.ID, Ref: pol.PushURLRef, PingMs: -1}
+		switch {
+		case o.status == model.StatusSuccess:
+			if r.StartedAt != nil {
+				x.PingMs = finished.Sub(*r.StartedAt).Milliseconds()
+			}
+			x.Up, x.Status = true, "up"
+			e.d.Pusher.Enqueue(x)
+		case o.successor == nil && pol.PushOnFailure &&
+			(o.status == model.StatusFailed || o.status == model.StatusTimeout || o.status == model.StatusInterrupted):
+			x.Status = string(o.status)
+			e.d.Pusher.Enqueue(x)
+		}
 	}
 	if skips == 3 && je != nil {
 		e.pageJob(je.job, notify.Fail, "skipped 3 consecutive runs", "Its runtime exceeds its interval; overlap=skip is dropping occurrences.")

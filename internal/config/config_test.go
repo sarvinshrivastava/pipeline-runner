@@ -110,3 +110,25 @@ func TestClientCapZeroDisables(t *testing.T) {
 		t.Fatalf("cap %d, err %v", c.MaxHTTPPerClient, err)
 	}
 }
+
+func TestPushURLHostsParse(t *testing.T) {
+	env := validEnv()
+	env["PUSH_URL_HOSTS"] = "Status.VPS.example.com, uptime-kuma"
+	c, err := load(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.PushURLHosts) != 2 || c.PushURLHosts[0] != "status.vps.example.com" || c.PushURLHosts[1] != "uptime-kuma" {
+		t.Fatalf("PushURLHosts = %v", c.PushURLHosts)
+	}
+}
+
+func TestPushURLHostsRejectsScheme(t *testing.T) {
+	for _, v := range []string{"https://x", "x:3001", "*.x", "x/path", "-x"} {
+		env := validEnv()
+		env["PUSH_URL_HOSTS"] = v
+		if _, err := load(env); err == nil || !strings.Contains(err.Error(), "PUSH_URL_HOSTS") {
+			t.Errorf("%q: err = %v, want a PUSH_URL_HOSTS error", v, err)
+		}
+	}
+}

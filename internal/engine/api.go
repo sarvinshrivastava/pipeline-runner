@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/schedule"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
@@ -24,19 +26,31 @@ func (e *Engine) vctx(owner model.Principal) model.VCtx {
 }
 
 // checkRefsExist enforces that every reference exists in the vault at write
-// time, so a typo fails now rather than at 4 a.m.
-func (e *Engine) checkRefsExist(ctx context.Context, spec model.RunSpec) error {
-	for _, ref := range spec.Refs() {
+// time, so a typo fails now rather than at 4 a.m. policyRefs are a job
+// policy's refs (push_url_ref), reported on that field.
+func (e *Engine) checkRefsExist(ctx context.Context, spec model.RunSpec, policyRefs ...string) error {
+	check := func(ref, field string) error {
 		parsed, err := vault.ParseRef(ref)
 		if err != nil {
-			return &model.FieldError{Field: "target", Code: "invalid", Message: err.Error()}
+			return &model.FieldError{Field: field, Code: "invalid", Message: err.Error()}
 		}
 		ok, err := e.d.Secrets.Exists(ctx, parsed)
 		if err != nil {
 			return ErrVaultDown
 		}
 		if !ok {
-			return &model.FieldError{Field: "target", Code: "secret_ref_missing", Message: "secret " + ref + " does not exist in the secrets manager"}
+			return &model.FieldError{Field: field, Code: "secret_ref_missing", Message: "secret " + ref + " does not exist in the secrets manager"}
+		}
+		return nil
+	}
+	for _, ref := range spec.Refs() {
+		if err := check(ref, "target"); err != nil {
+			return err
+		}
+	}
+	for _, ref := range policyRefs {
+		if err := check(ref, "policy.push_url_ref"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -73,7 +87,7 @@ func (e *Engine) ValidateJob(ctx context.Context, owner model.Principal, in mode
 	if err != nil {
 		return j, err
 	}
-	return j, e.checkRefsExist(ctx, j.Spec())
+	return j, e.checkRefsExist(ctx, j.Spec(), j.Policy.PolicyRefs()...)
 }
 
 // checkResolves resolves the callback host and applies the dial-time policy,
@@ -104,7 +118,7 @@ func (e *Engine) CreateJob(ctx context.Context, owner model.Principal, in model.
 	if err != nil {
 		return j, err
 	}
-	if err := e.checkRefsExist(ctx, j.Spec()); err != nil {
+	if err := e.checkRefsExist(ctx, j.Spec(), j.Policy.PolicyRefs()...); err != nil {
 		return j, err
 	}
 	now := e.now()
@@ -171,7 +185,7 @@ func (e *Engine) UpdateJob(ctx context.Context, jobID string, patch model.JobPat
 	if err != nil {
 		return cur, err
 	}
-	if err := e.checkRefsExist(ctx, preview.Spec()); err != nil {
+	if err := e.checkRefsExist(ctx, preview.Spec(), preview.Policy.PolicyRefs()...); err != nil {
 		return cur, err
 	}
 
@@ -609,6 +623,9 @@ func (e *Engine) CheckJob(ctx context.Context, j model.Job, owner model.Principa
 		add("secret "+ref, e.checkRefsExist(ctx, model.RunSpec{Target: model.Target{Type: model.TargetHTTP,
 			HTTP: &model.HTTPTarget{Auth: model.HTTPAuth{BearerRef: ref}}}}))
 	}
+	if j.Policy.PushURLRef != "" {
+		e.checkPush(ctx, j.Policy.PushURLRef, owner, add)
+	}
 	if j.Trigger.Type == model.TriggerCron || j.Trigger.Type == model.TriggerAt {
 		var err error
 		if len(NextFires(j, e.now(), 1)) == 0 {
@@ -617,4 +634,35 @@ func (e *Engine) CheckJob(ctx context.Context, j model.Job, owner model.Principa
 		add("schedule", err)
 	}
 	return checks
+}
+
+// checkPush reports whether a push ref is permitted and exists, and whether
+// its value passes the push URL rules. Details name the rule or the host,
+// never the URL.
+func (e *Engine) checkPush(ctx context.Context, ref string, owner model.Principal, add func(string, error)) {
+	if _, err := model.CheckRef(ref, owner); err != nil {
+		add("push_url_ref", err)
+		return
+	}
+	parsed, err := vault.ParseRef(ref)
+	if err != nil {
+		add("push_url_ref", err)
+		return
+	}
+	v, err := e.d.Secrets.Get(ctx, parsed)
+	switch {
+	case errors.Is(err, vault.ErrMissing):
+		add("push_url_ref", errors.New("secret "+ref+" does not exist in the secrets manager"))
+		return
+	case err != nil:
+		add("push_url_ref", ErrVaultDown)
+		return
+	}
+	add("push_url_ref", nil)
+	u, err := jobpush.CheckURL(strings.TrimSpace(v), e.d.PushHosts)
+	add("push_url", err)
+	if err == nil && e.d.CallbackPolicy != nil {
+		// Scheme and host only: the token never enters checkResolves.
+		add("push_dns", e.checkResolves(ctx, (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()))
+	}
 }

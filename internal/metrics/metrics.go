@@ -29,9 +29,11 @@ type Metrics struct {
 	// Coalesced counts cron occurrences that never got a run: reason
 	// "backlog" (collapsed inside max_late) or "expired" (older than max_late).
 	Coalesced *prometheus.CounterVec
+	// JobPush counts per-job Kuma pushes by result.
+	JobPush *prometheus.CounterVec
 
 	seriesMu sync.Mutex
-	series   map[[2]string]struct{} // {job, client} pairs with a Coalesced series
+	series   map[[2]string]struct{} // {job, client} pairs with a Coalesced or JobPush series
 }
 
 // New builds the collectors. loopAge reports the engine loop age in seconds.
@@ -66,10 +68,13 @@ func New(loopAge func() float64) *Metrics {
 		Coalesced: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "plr_coalesced_occurrences_total", Help: "Cron occurrences that did not run: folded into a later run (reason=backlog) or past max_late_sec (reason=expired).",
 		}, []string{"job", "client", "reason"}),
+		JobPush: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "plr_job_push_total", Help: "Per-job Kuma pushes by result.",
+		}, []string{"job", "client", "result"}),
 		series: map[[2]string]struct{}{},
 	}
 	m.Registry.MustRegister(m.FireDelay, m.RunsTotal, m.RunDuration, m.Late, m.PendingRuns, m.Inflight, m.QueueDepth,
-		m.WaitingRuns, m.SkippedTotal, m.UnflushedWrites, m.EngineLoopAgeSec, m.Coalesced,
+		m.WaitingRuns, m.SkippedTotal, m.UnflushedWrites, m.EngineLoopAgeSec, m.Coalesced, m.JobPush,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }
@@ -85,27 +90,39 @@ func (m *Metrics) AddCoalesced(job, client, reason string, n int) {
 	m.Coalesced.WithLabelValues(job, client, reason).Add(float64(n))
 }
 
-// DeleteCoalesced drops every series of one job.
-func (m *Metrics) DeleteCoalesced(job, client string) {
+// AddJobPush counts one per-job push result. The series is recorded first,
+// so one re-created by a push that finishes after its job's delete is
+// removed by the next SweepJobSeries. Safe from any goroutine; it never
+// calls back into the pusher.
+func (m *Metrics) AddJobPush(job, client, result string) {
 	m.seriesMu.Lock()
 	defer m.seriesMu.Unlock()
-	m.deleteCoalescedLocked([2]string{job, client})
+	m.series[[2]string{job, client}] = struct{}{}
+	m.JobPush.WithLabelValues(job, client, result).Inc()
 }
 
-// SweepCoalesced drops the series of every job for which live is false.
-func (m *Metrics) SweepCoalesced(live func(job, client string) bool) {
+// DeleteJobSeries drops every per-job series of one job.
+func (m *Metrics) DeleteJobSeries(job, client string) {
+	m.seriesMu.Lock()
+	defer m.seriesMu.Unlock()
+	m.deleteJobSeriesLocked([2]string{job, client})
+}
+
+// SweepJobSeries drops the per-job series of every job for which live is false.
+func (m *Metrics) SweepJobSeries(live func(job, client string) bool) {
 	m.seriesMu.Lock()
 	defer m.seriesMu.Unlock()
 	for k := range m.series {
 		if !live(k[0], k[1]) {
-			m.deleteCoalescedLocked(k)
+			m.deleteJobSeriesLocked(k)
 		}
 	}
 }
 
-func (m *Metrics) deleteCoalescedLocked(k [2]string) {
+func (m *Metrics) deleteJobSeriesLocked(k [2]string) {
 	delete(m.series, k)
 	m.Coalesced.DeletePartialMatch(prometheus.Labels{"job": k[0], "client": k[1]})
+	m.JobPush.DeletePartialMatch(prometheus.Labels{"job": k[0], "client": k[1]})
 }
 
 // Handler serves the registry.

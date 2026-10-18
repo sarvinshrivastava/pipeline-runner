@@ -272,7 +272,15 @@ func (e *Engine) reconcile(now time.Time) {
 	for _, j := range jobs {
 		fresh[j.ID] = newJobEntry(j, now)
 	}
+	old := e.jobs
 	e.jobs = fresh
+	if e.d.Pusher != nil {
+		for id := range old {
+			if fresh[id] == nil {
+				e.d.Pusher.Forget(id)
+			}
+		}
+	}
 	// Jobs deleted behind the loop's back (a lost event) take their page
 	// counts and coalesced series with them.
 	for id := range e.pageBatch {
@@ -290,7 +298,7 @@ func (e *Engine) reconcile(now time.Time) {
 		for _, je := range fresh {
 			live[[2]string{je.job.Name, je.job.ClientID}] = true
 		}
-		m.SweepCoalesced(func(job, client string) bool { return live[[2]string{job, client}] })
+		m.SweepJobSeries(func(job, client string) bool { return live[[2]string{job, client}] })
 	}
 
 	pending, err := store.RunsByStatus(ctx, e.st.R, model.StatusPending)

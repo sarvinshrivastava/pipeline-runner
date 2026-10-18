@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/metrics"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
@@ -95,6 +96,17 @@ type Deps struct {
 	// CallbackPolicy is the dial-time IP policy; the validate checks apply
 	// it to the resolved callback host. nil skips that check.
 	CallbackPolicy secure.IPPolicy
+	// Pusher delivers per-job Kuma pushes off the loop; nil disables them.
+	Pusher Pusher
+	// PushHosts is PUSH_URL_HOSTS, for the validate checks.
+	PushHosts []string
+}
+
+// Pusher is the engine's view of jobpush.Pusher.
+type Pusher interface {
+	Enqueue(jobpush.Push)
+	// Forget drops a deleted job's waiting push and its coalescing records.
+	Forget(jobID string)
 }
 
 type held struct {
