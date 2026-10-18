@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"time"
 
 	"github.com/google/uuid"
@@ -255,6 +256,24 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		e.page(r, notify.Fail, o.pageTitle, o.err)
 	case o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && je.job.Policy.NotifyOnSuccess:
 		e.page(r, notify.OK, "succeeded", "Run "+r.ID+" succeeded.")
+	}
+	if je != nil && e.d.Pusher != nil && je.job.Policy.PushURLRef != "" {
+		// The current policy, not the run's revision: the ref names an
+		// operator monitor, so a change applies from the next terminal write.
+		pol := je.job.Policy
+		x := jobpush.Push{JobID: je.job.ID, JobName: r.JobName, ClientID: r.ClientID, RunID: r.ID, Ref: pol.PushURLRef, PingMs: -1}
+		switch {
+		case o.status == model.StatusSuccess:
+			if r.StartedAt != nil {
+				x.PingMs = e.now().Sub(*r.StartedAt).Milliseconds()
+			}
+			x.Up, x.Status = true, "up"
+			e.d.Pusher.Enqueue(x)
+		case o.successor == nil && pol.PushOnFailure &&
+			(o.status == model.StatusFailed || o.status == model.StatusTimeout || o.status == model.StatusInterrupted):
+			x.Status = string(o.status)
+			e.d.Pusher.Enqueue(x)
+		}
 	}
 	if skips == 3 && je != nil {
 		e.pageJob(je.job, notify.Fail, "skipped 3 consecutive runs", "Its runtime exceeds its interval; overlap=skip is dropping occurrences.")

@@ -272,7 +272,15 @@ func (e *Engine) reconcile(now time.Time) {
 	for _, j := range jobs {
 		fresh[j.ID] = newJobEntry(j, now)
 	}
+	old := e.jobs
 	e.jobs = fresh
+	if e.d.Pusher != nil {
+		for id := range old {
+			if fresh[id] == nil {
+				e.d.Pusher.Forget(id)
+			}
+		}
+	}
 	// Jobs deleted behind the loop's back (a lost event) take their page
 	// counts and coalesced series with them.
 	for id := range e.pageBatch {

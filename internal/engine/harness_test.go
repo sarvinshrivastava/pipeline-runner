@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -10,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/metrics"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/secure"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/target"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/vault"
@@ -119,6 +122,17 @@ type harness struct {
 	maxHTTP   int
 	perClient int // 0: no per-client cap, so existing tests run uncapped
 	metrics   *metrics.Metrics
+
+	pusher         Pusher
+	secrets        SecretSource
+	pushHosts      []string
+	callbackPolicy secure.IPPolicy
+}
+
+// Pusher is the engine's view of jobpush.Pusher.
+type Pusher = interface {
+	Enqueue(jobpush.Push)
+	Forget(jobID string)
 }
 
 type opt func(*harness)
@@ -131,9 +145,48 @@ func withMetrics() opt {
 	return func(h *harness) { h.metrics = metrics.New(func() float64 { return 0 }) }
 }
 
+func withPusher(p Pusher) opt { return func(h *harness) { h.pusher = p } }
+
+func withSecrets(s SecretSource) opt { return func(h *harness) { h.secrets = s } }
+
+func withPushHosts(hosts []string) opt { return func(h *harness) { h.pushHosts = hosts } }
+
+func withCallbackPolicy(p secure.IPPolicy) opt { return func(h *harness) { h.callbackPolicy = p } }
+
+// mapSecrets is a vault backed by a ref → value map. A missing key does not
+// exist; err, when set, makes every call fail (the vault is down).
+type mapSecrets struct {
+	mu   sync.Mutex
+	vals map[string]string
+	err  error
+}
+
+func (m *mapSecrets) Get(_ context.Context, r vault.Ref) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return "", m.err
+	}
+	v, ok := m.vals[r.String()]
+	if !ok {
+		return "", fmt.Errorf("%w: %s", vault.ErrMissing, r)
+	}
+	return v, nil
+}
+
+func (m *mapSecrets) Exists(_ context.Context, r vault.Ref) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return false, m.err
+	}
+	_, ok := m.vals[r.String()]
+	return ok, nil
+}
+
 func newHarness(t *testing.T, opts ...opt) *harness {
 	t.Helper()
-	h := &harness{t: t, dir: t.TempDir(), clk: NewFakeClock(t0), exec: &fakeExec{}, pager: &fakePager{}, maxHTTP: 64}
+	h := &harness{t: t, dir: t.TempDir(), clk: NewFakeClock(t0), exec: &fakeExec{}, pager: &fakePager{}, maxHTTP: 64, secrets: fakeSecrets{}}
 	for _, o := range opts {
 		o(h)
 	}
@@ -163,9 +216,10 @@ func (h *harness) addClient(name string) model.Principal {
 func (h *harness) start() {
 	h.e = New(Deps{
 		Store: h.st, Clock: h.clk, Executors: map[string]target.Executor{model.TargetHTTP: h.exec},
-		Secrets: fakeSecrets{}, Pager: h.pager, Metrics: h.metrics, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Secrets: h.secrets, Pager: h.pager, Metrics: h.metrics, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		RunTokenKey: []byte("run-key"), EnvKey: bytes.Repeat([]byte{1}, 32), MaxHTTPInflight: h.maxHTTP, MaxHTTPPerClient: h.perClient, MaxContainers: 4,
 		DataDir: h.dir, RetentionDays: 60, Rand: func(int64) int64 { return 0 },
+		Pusher: h.pusher, PushHosts: h.pushHosts, CallbackPolicy: h.callbackPolicy,
 	})
 	if err := h.e.Start(context.Background()); err != nil {
 		h.t.Fatal(err)

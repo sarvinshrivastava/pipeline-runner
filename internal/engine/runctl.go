@@ -368,6 +368,9 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 		if je := e.jobs[v.jobID]; je != nil && e.d.Metrics != nil {
 			e.d.Metrics.DeleteJobSeries(je.job.Name, je.job.ClientID)
 		}
+		if e.d.Pusher != nil {
+			e.d.Pusher.Forget(v.jobID)
+		}
 		delete(e.jobs, v.jobID)
 		delete(e.pageBatch, v.jobID)
 		delete(e.lastMissPage, v.jobID)

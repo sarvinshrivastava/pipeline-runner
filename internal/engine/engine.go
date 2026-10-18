@@ -12,6 +12,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"log/slog"
 	"math/rand/v2"
 	"path/filepath"
@@ -95,6 +96,13 @@ type Deps struct {
 	// CallbackPolicy is the dial-time IP policy; the validate checks apply
 	// it to the resolved callback host. nil skips that check.
 	CallbackPolicy secure.IPPolicy
+	// Pusher delivers per-job Kuma pushes off the loop; nil disables them.
+	Pusher interface {
+		Enqueue(jobpush.Push)
+		Forget(jobID string)
+	}
+	// PushHosts is PUSH_URL_HOSTS, for the validate checks.
+	PushHosts []string
 }
 
 type held struct {
