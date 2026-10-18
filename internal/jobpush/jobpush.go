@@ -77,8 +77,8 @@ type Pusher struct {
 	cfg Config
 
 	mu        sync.Mutex
-	pending   map[string]Push    // jobID → latest waiting push
-	order     []string           // jobIDs in the arrival order of their waiting push
+	pending   map[string]Push     // jobID → latest waiting push
+	order     []string            // jobIDs in the arrival order of their waiting push
 	sent      map[sentKey]attempt // (job, ref) → last attempted state and time
 	lastSweep time.Time
 	wake      chan struct{} // cap 1

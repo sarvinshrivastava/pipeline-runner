@@ -46,11 +46,16 @@ var callbackPolicy secure.IPPolicy = secure.IPAllowed
 
 // Job push limits: the HTTP client timeout and the per-push budget (client
 // lookup, vault read and the GET). Variables so serve tests can hold a push
-// in flight longer than the shutdown windows they measure.
+// in flight longer than the shutdown windows they measure. Tests that
+// override them must not call t.Parallel().
 var (
 	pushHTTPTimeout = 3 * time.Second
 	pushBudget      = 5 * time.Second
 )
+
+// drainBudget bounds the final drains: the pager and push drains at shutdown
+// share it, and joinPush uses it on an early return.
+const drainBudget = 5 * time.Second
 
 func main() {
 	cmd := "serve"
@@ -235,7 +240,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	// serves both drains; paging starts first and is never delayed by the
 	// push worker's join (at most one push in flight, bounded by its timeout).
 	stopNotify()
-	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), drainBudget)
 	defer cancelDrain()
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -255,7 +260,7 @@ var _ engine.Pusher = (*jobpush.Pusher)(nil)
 func joinPush(stop context.CancelFunc, done <-chan struct{}, p *jobpush.Pusher) {
 	stop()
 	<-done
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), drainBudget)
 	defer cancel()
 	p.Drain(ctx)
 }

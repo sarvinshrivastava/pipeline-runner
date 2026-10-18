@@ -213,6 +213,8 @@ func TestServeWiresJobPush(t *testing.T) {
 func TestShutdownPagerDrainNotDelayedByPushJoin(t *testing.T) {
 	// Hold push A far beyond the 2 s window below: with the production 3 s
 	// HTTP timeout, a serial drain could still squeeze page B in under 2 s.
+	// Overrides package vars: never t.Parallel(). A failed check still releases
+	// push A through the release defer below, before kuma.Close and the rig cleanup.
 	oldHTTP, oldBudget := pushHTTPTimeout, pushBudget
 	pushHTTPTimeout, pushBudget = 30*time.Second, 30*time.Second
 	t.Cleanup(func() { pushHTTPTimeout, pushBudget = oldHTTP, oldBudget })
@@ -318,8 +320,10 @@ func TestJoinPushDrainsOnEarlyReturn(t *testing.T) {
 	var mu sync.Mutex
 	results := map[string]int{}
 	p := jobpush.New(jobpush.Config{
-		Clients: func(context.Context, string) (model.Principal, error) { return model.Principal{}, jobpush.ErrClientGone },
-		Hosts:   []string{"localhost"},
+		Clients: func(context.Context, string) (model.Principal, error) {
+			return model.Principal{}, jobpush.ErrClientGone
+		},
+		Hosts: []string{"localhost"},
 		Count: func(_, _, r string) {
 			mu.Lock()
 			results[r]++

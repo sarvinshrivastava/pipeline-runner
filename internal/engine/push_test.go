@@ -250,7 +250,7 @@ func TestDeletedJobNoPush(t *testing.T) {
 
 func TestPushAfterUnflushedReplay(t *testing.T) {
 	fp := &fakePusher{}
-	h := newHarness(t, withPusher(fp))
+	h := newHarness(t, withPusher(fp), withMetrics())
 	ctx := context.Background()
 	if _, err := h.st.W.ExecContext(ctx, `CREATE TRIGGER boom BEFORE UPDATE OF status ON runs
 		WHEN NEW.status = 'success' BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
@@ -271,6 +271,32 @@ func TestPushAfterUnflushedReplay(t *testing.T) {
 	if ps := fp.all(); len(ps) != 1 || !ps[0].Up || ps[0].PingMs < 0 || ps[0].PingMs >= 1000 {
 		t.Fatalf("pushes after replay = %+v", ps)
 	}
+	// The run-duration histogram uses the same clock: the 1 s replay wait is excluded.
+	if n, sum := runDurationOf(t, h, "f"); n != 1 || sum >= 1 {
+		t.Fatalf("plr_run_duration_seconds for f: count %d, sum %v; want 1 sample under 1 s", n, sum)
+	}
+}
+
+// runDurationOf reads plr_run_duration_seconds for one job: sample count and sum.
+func runDurationOf(t *testing.T, h *harness, job string) (uint64, float64) {
+	t.Helper()
+	mfs, err := h.metrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "plr_run_duration_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, p := range m.GetLabel() {
+				if p.GetName() == "job" && p.GetValue() == job {
+					return m.GetHistogram().GetSampleCount(), m.GetHistogram().GetSampleSum()
+				}
+			}
+		}
+	}
+	return 0, 0
 }
 
 func fieldErrOf(t *testing.T, err error) *model.FieldError {

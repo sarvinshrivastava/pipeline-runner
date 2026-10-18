@@ -231,9 +231,6 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 	// The run's end is finalize's clock, not now: an unflushed replay can run
 	// afterFinalize long after the run finished.
 	finished := o.finishedAt
-	if finished.IsZero() {
-		finished = e.now()
-	}
 
 	je := e.jobs[r.JobID]
 	if je != nil {
