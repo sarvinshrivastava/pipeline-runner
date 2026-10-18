@@ -692,3 +692,57 @@ func TestClientAdminRoutes(t *testing.T) {
 		t.Fatalf("second delete: %d", r.status)
 	}
 }
+
+// ---------------------------------------------------------------- 9. job push fields
+
+func TestJobPolicyPushFieldsRoundTrip(t *testing.T) {
+	e := newEnv(t)
+	_, tok := e.client("a", all...)
+	job := fnJob("tick")
+	job["policy"] = map[string]any{"push_url_ref": "Svc/TOKEN", "push_on_failure": false}
+	r := e.do("POST", "/v1/jobs", tok, job)
+	if r.status != 201 {
+		t.Fatalf("create: %d %s", r.status, r.body)
+	}
+	id := r.json(t)["id"].(string)
+	got := e.do("GET", "/v1/jobs/"+id, tok, nil)
+	pol := got.json(t)["policy"].(map[string]any)
+	if pol["push_url_ref"] != "Svc/TOKEN" || pol["push_on_failure"] != false {
+		t.Fatalf("policy = %v", pol)
+	}
+	if strings.Contains(string(got.body), "/api/push/") {
+		t.Fatalf("a push URL leaked: %s", got.body)
+	}
+	// A policy PATCH that omits the push fields keeps them.
+	r = e.do("PATCH", "/v1/jobs/"+id, tok, map[string]any{"policy": map[string]any{"timeout_sec": 60}})
+	if r.status != 200 {
+		t.Fatalf("patch: %d %s", r.status, r.body)
+	}
+	pol = r.json(t)["policy"].(map[string]any)
+	if pol["push_url_ref"] != "Svc/TOKEN" || pol["push_on_failure"] != false {
+		t.Fatalf("patched policy = %v", pol)
+	}
+	// A job without the field shows the default.
+	r = e.do("POST", "/v1/jobs", tok, fnJob("plain"))
+	if pol := r.json(t)["policy"].(map[string]any); pol["push_on_failure"] != true || pol["push_url_ref"] != nil {
+		t.Fatalf("default policy = %v", pol)
+	}
+	missing := fnJob("missing")
+	missing["policy"] = map[string]any{"push_url_ref": "Svc/NOPE"}
+	if r := e.do("POST", "/v1/jobs", tok, missing); r.status != 400 || fieldOf(r) != "policy.push_url_ref" {
+		t.Fatalf("missing ref: %d %s", r.status, r.body)
+	}
+}
+
+func TestAdhocPushRefRejected(t *testing.T) {
+	e := newEnv(t)
+	_, tok := e.client("a", all...)
+	adhoc := map[string]any{"target": fnJob("x")["target"], "policy": map[string]any{"push_url_ref": "Svc/TOKEN"}}
+	if r := e.do("POST", "/v1/runs", tok, adhoc); r.status != 400 || fieldOf(r) != "policy.push_url_ref" {
+		t.Fatalf("adhoc with push_url_ref: %d %s", r.status, r.body)
+	}
+	adhoc["policy"] = map[string]any{"push_on_failure": false}
+	if r := e.do("POST", "/v1/runs", tok, adhoc); r.status != 202 {
+		t.Fatalf("adhoc push_on_failure must be ignored: %d %s", r.status, r.body)
+	}
+}
