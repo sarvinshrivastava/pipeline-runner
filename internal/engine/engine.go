@@ -12,7 +12,6 @@ package engine
 import (
 	"context"
 	"errors"
-	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"log/slog"
 	"math/rand/v2"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/metrics"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"

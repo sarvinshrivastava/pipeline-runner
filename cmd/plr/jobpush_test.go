@@ -186,7 +186,7 @@ func TestServeWiresJobPush(t *testing.T) {
 func TestShutdownPagerDrainNotDelayedByPushJoin(t *testing.T) {
 	pages := make(chan string, 10)
 	var first atomic.Bool
-	ntfy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ntfy := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		var m struct{ Title string }
 		_ = json.NewDecoder(r.Body).Decode(&m)
 		if first.CompareAndSwap(false, true) {

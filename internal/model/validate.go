@@ -216,7 +216,8 @@ func ValidatePatch(cur Job, in JobPatch, c VCtx) (next Job, triggerChanged bool,
 	if in.Trigger != nil {
 		trigType = in.Trigger.Type
 	}
-	if in.Policy != nil || in.Target != nil || in.Trigger != nil {
+	recomputed := in.Policy != nil || in.Target != nil || in.Trigger != nil
+	if recomputed {
 		// A new trigger or target can change policy defaults (overlap).
 		pin := in.Policy
 		if pin != nil {
@@ -254,7 +255,7 @@ func ValidatePatch(cur Job, in JobPatch, c VCtx) (next Job, triggerChanged bool,
 	} else if next.Trigger.Type == TriggerAt && next.Policy.JitterSec >= next.Policy.MaxLateSec {
 		return Job{}, false, fieldErr("policy.jitter_sec", "invalid", "must be less than max_late_sec")
 	}
-	if in.Policy != nil || in.Target != nil || in.Trigger != nil {
+	if recomputed {
 		// Re-check a kept ref against the current prefixes and trigger.
 		if err = checkPush(&next.Policy, next.Trigger, c.Principal); err != nil {
 			return Job{}, false, err
