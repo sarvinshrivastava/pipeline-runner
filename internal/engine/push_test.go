@@ -141,8 +141,12 @@ func TestNoPushForSkippedCancelledMissed(t *testing.T) {
 			t.Fatalf("status = %s", r.Status)
 		}
 		h.sync()
-		if ps := fp.all(); len(ps) != 0 {
-			t.Fatalf("pushes = %+v", ps)
+		// The outage collapses to the current occurrence, which may run and
+		// push up; the missed run itself must push nothing.
+		for _, p := range fp.all() {
+			if p.RunID == first.ID || !p.Up {
+				t.Fatalf("pushes = %+v", fp.all())
+			}
 		}
 	})
 	t.Run("cancelled", func(t *testing.T) {
