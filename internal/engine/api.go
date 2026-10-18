@@ -662,6 +662,7 @@ func (e *Engine) checkPush(ctx context.Context, ref string, owner model.Principa
 	u, err := jobpush.CheckURL(strings.TrimSpace(v), e.d.PushHosts)
 	add("push_url", err)
 	if err == nil && e.d.CallbackPolicy != nil {
-		add("push_dns", e.checkResolves(ctx, u.String()))
+		// Scheme and host only: the token never enters checkResolves.
+		add("push_dns", e.checkResolves(ctx, (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()))
 	}
 }

@@ -162,8 +162,10 @@ func (p *Pusher) Run(ctx context.Context) {
 
 // Drain delivers what is pending until ctx ends. Call it only after Run has
 // returned, so there is one consumer at a time. It stops popping when ctx
-// has less than a second left; each push is bounded by ctx too.
+// has less than a second left; each push is bounded by ctx too. Pushes it
+// leaves behind are counted failed and logged once.
 func (p *Pusher) Drain(ctx context.Context) {
+	defer p.dropPending()
 	for {
 		if ctx.Err() != nil {
 			return
@@ -179,6 +181,26 @@ func (p *Pusher) Drain(ctx context.Context) {
 		}
 		p.sendOne(ctx, x)
 	}
+}
+
+// dropPending counts every push still waiting as failed (shutdown ran out
+// of drain time).
+func (p *Pusher) dropPending() {
+	p.mu.Lock()
+	left := make([]Push, 0, len(p.pending))
+	for _, x := range p.pending {
+		left = append(left, x)
+	}
+	clear(p.pending)
+	p.order = nil
+	p.mu.Unlock()
+	if len(left) == 0 {
+		return
+	}
+	for _, x := range left {
+		p.count(x, ResultFailed)
+	}
+	p.cfg.Log.Warn("job pushes dropped at shutdown: drain time ran out", "count", len(left))
 }
 
 func (p *Pusher) popLocked() (Push, bool) {
@@ -288,10 +310,14 @@ func (p *Pusher) deliver(parent context.Context, x Push) string {
 		return ResultFailed
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Debug("job push sent", "result", ResultOK, "up", x.Up)
 		return ResultOK
+	}
+	if readErr != nil {
+		log.Warn("job push rejected", "result", ResultFailed, "status", resp.StatusCode, "read_err", readErr)
+		return ResultFailed
 	}
 	log.Warn("job push rejected", "result", ResultFailed, "status", resp.StatusCode, "msg", kumaMsg(body))
 	return ResultFailed
@@ -334,6 +360,9 @@ var pushPathRE = regexp.MustCompile(`^/api/push/[A-Za-z0-9_-]{8,128}$`)
 // CheckURL applies the push destination rules to a vault value. The dial
 // policy is enforced separately, at connect time.
 func CheckURL(raw string, hosts []string) (*url.URL, error) {
+	if len(hosts) == 0 {
+		return nil, ErrHostsEmpty
+	}
 	if len(raw) > 2048 {
 		return nil, ErrURLTooLong
 	}
@@ -351,9 +380,6 @@ func CheckURL(raw string, hosts []string) (*url.URL, error) {
 	}
 	if u.User != nil {
 		return nil, ErrURLUserinfo
-	}
-	if len(hosts) == 0 {
-		return nil, ErrHostsEmpty
 	}
 	if !slices.Contains(hosts, host) {
 		return nil, ErrHostNotListed

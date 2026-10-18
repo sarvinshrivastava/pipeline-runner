@@ -244,7 +244,7 @@ func storeClients(st *store.Store) func(context.Context, string) (model.Principa
 			return model.Principal{}, jobpush.ErrClientGone
 		}
 		if err != nil {
-			return model.Principal{}, err
+			return model.Principal{}, fmt.Errorf("get client %s: %w", id, err)
 		}
 		return model.PrincipalOf(c), nil
 	}

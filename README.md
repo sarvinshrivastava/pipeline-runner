@@ -128,10 +128,10 @@ What is sent:
 
 - After a successful run: `status=up`, with the run duration as `ping`.
 - After a final failure (`failed`, `timeout` or `interrupted`, no retry left): `status=down`, with the status word as `msg`. Set `push_on_failure: false` to send only the up pings.
-- Missed, skipped and cancelled runs send nothing, and neither does a disabled job: pause its monitor in Kuma when you disable the job. One-shot (`at`/`delay`) jobs and ad-hoc runs cannot have a push.
+- Missed, skipped and cancelled runs send nothing. Disabling a job stops new runs, so it stops pushing; a run already in flight still reports its result. Pause the monitor in Kuma when you disable the job. One-shot (`at`/`delay`) jobs and ad-hoc runs cannot have a push.
 - `POST /v1/jobs/{id}/validate` checks the ref, the URL rules and the host's address. The URL itself is never logged or returned.
 
-Pushes are best-effort: one GET with a 5 s timeout and no retry, and a repeat of the same state within 20 s is dropped. Set the monitor's heartbeat interval to at least: the schedule period (for an invoke job, the caller's cadence) + `jitter_sec` + `timeout_sec × max_attempts` + the sum of retry backoffs (each capped at `max_backoff_sec`) + 20 s, plus one more period if a single lost ping should not alert. For a job that runs more often than every 20 s, use at least 60 s. A daily job with no retries needs about 25 h.
+Pushes are best-effort: one GET (3 s HTTP timeout) inside a 5 s per-push budget that also covers the client lookup and the vault read, no retry, and a repeat of the same state within 20 s is dropped. Set the monitor's heartbeat interval to at least: the schedule period (for an invoke job, the caller's cadence) + `jitter_sec` + `timeout_sec × max_attempts` + the sum of retry backoffs (each capped at `max_backoff_sec`) + 20 s, plus one more period if a single lost ping should not alert. For a job that runs more often than every 20 s, use at least 60 s. A daily job with no retries needs about 25 h.
 
 ## Operations
 

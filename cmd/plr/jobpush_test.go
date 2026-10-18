@@ -143,10 +143,13 @@ func (r *pushRig) waitRun(tok, runID, status string) {
 }
 
 func TestServeWiresJobPush(t *testing.T) {
-	var pushes atomic.Int32
+	var pushes, ups atomic.Int32
 	kuma := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/push/"+pushToken && r.URL.Query().Get("status") == "up" {
+		if r.URL.Path == "/api/push/"+pushToken {
 			pushes.Add(1)
+			if r.URL.Query().Get("status") == "up" {
+				ups.Add(1)
+			}
 		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -157,6 +160,17 @@ func TestServeWiresJobPush(t *testing.T) {
 
 	rig := startRig(t, nil, vault.URL)
 	tok, job := rig.pushJob("tick", "http://127.0.0.1:"+port(t, tgt)+"/hook")
+
+	// The engine got PUSH_URL_HOSTS too: validate passes the push_url check.
+	checks := map[string]bool{}
+	for _, c := range rig.call("POST", "/v1/jobs/"+job+"/validate", tok, nil)["checks"].([]any) {
+		m := c.(map[string]any)
+		checks[m["name"].(string)], _ = m["ok"].(bool)
+	}
+	if !checks["push_url_ref"] || !checks["push_url"] {
+		t.Fatalf("validate push checks = %v", checks)
+	}
+
 	runID := rig.call("POST", "/v1/jobs/"+job+"/invoke", tok, nil)["id"].(string)
 	rig.waitRun(tok, runID, "success")
 	deadline := time.Now().Add(10 * time.Second)
@@ -166,10 +180,6 @@ func TestServeWiresJobPush(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	time.Sleep(100 * time.Millisecond) // a second push would have arrived by now
-	if n := pushes.Load(); n != 1 {
-		t.Fatalf("pushes = %d, want 1", n)
-	}
 	rig.cancel()
 	select {
 	case err := <-rig.done:
@@ -178,6 +188,11 @@ func TestServeWiresJobPush(t *testing.T) {
 		}
 	case <-time.After(25 * time.Second):
 		t.Fatal("shutdown hung")
+	}
+	// run has returned: the worker is joined and drained, so every push it
+	// would ever send has been sent.
+	if n, u := pushes.Load(), ups.Load(); n != 1 || u != 1 {
+		t.Fatalf("pushes = %d (up %d), want exactly one up", n, u)
 	}
 }
 
@@ -250,12 +265,14 @@ func TestShutdownPagerDrainNotDelayedByPushJoin(t *testing.T) {
 
 	start := time.Now()
 	rig.cancel()
+	// Well under the push timeout (5 s): if the pager drain waited for the
+	// push worker's join, page B would only arrive once push A timed out.
 	select {
 	case p := <-pages:
 		if !strings.HasPrefix(p, "b:") {
 			t.Fatalf("drained page = %q", p)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("the queued page was not delivered while the push was stuck")
 	}
 	select {

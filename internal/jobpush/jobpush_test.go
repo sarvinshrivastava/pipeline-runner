@@ -65,9 +65,11 @@ type env struct {
 	reqs    chan url.Values
 	got     chan struct{}
 	release chan struct{}
-	block   func(r *http.Request) bool
-	status  int
-	body    string
+
+	smu    sync.Mutex // guards block, status, body: handlers read them
+	block  func(r *http.Request) bool
+	status int
+	body   string
 
 	secrets  *mapSecrets
 	prefixes []string
@@ -94,7 +96,10 @@ func newEnv(t *testing.T, mod func(*Config)) *env {
 	}
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.reqs <- r.URL.Query()
-		if e.block != nil && e.block(r) {
+		e.smu.Lock()
+		block, status, body := e.block, e.status, e.body
+		e.smu.Unlock()
+		if block != nil && block(r) {
 			e.got <- struct{}{}
 			select {
 			case <-e.release:
@@ -102,8 +107,8 @@ func newEnv(t *testing.T, mod func(*Config)) *env {
 				return
 			}
 		}
-		w.WriteHeader(e.status)
-		_, _ = w.Write([]byte(e.body))
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(func() {
 		select {
@@ -146,6 +151,18 @@ func newEnv(t *testing.T, mod func(*Config)) *env {
 	}
 	e.p = New(cfg)
 	return e
+}
+
+func (e *env) setBlock(f func(*http.Request) bool) {
+	e.smu.Lock()
+	e.block = f
+	e.smu.Unlock()
+}
+
+func (e *env) setResponse(status int, body string) {
+	e.smu.Lock()
+	e.status, e.body = status, body
+	e.smu.Unlock()
 }
 
 func (e *env) advance(d time.Duration) {
@@ -260,6 +277,7 @@ func TestCheckURLRules(t *testing.T) {
 		{"http://127.0.0.1" + tok, hosts, ErrURLScheme},
 		{"https://u:p@status.example.com" + tok, hosts, ErrURLUserinfo},
 		{"https://status.example.com" + tok, nil, ErrHostsEmpty},
+		{"http://u:p@status.example.com" + tok, nil, ErrHostsEmpty},
 		{"https://evil.example.com" + tok, hosts, ErrHostNotListed},
 		{"https://status.example.com:8443" + tok, hosts, ErrURLPort},
 		{"https://status.example.com/api/push/short", hosts, ErrURLPath},
@@ -323,7 +341,7 @@ func TestVaultDownFailed(t *testing.T) {
 
 func TestNon2xxFailed(t *testing.T) {
 	e := newEnv(t, nil)
-	e.status, e.body = 404, `{"ok":false,"msg":"Monitor not found or not active."}`
+	e.setResponse(404, `{"ok":false,"msg":"Monitor not found or not active."}`)
 	e.p.Enqueue(up("a"))
 	e.p.Drain(context.Background())
 	e.nextReq()
@@ -341,11 +359,11 @@ func TestNon2xxFailed(t *testing.T) {
 
 func TestURLNeverLogged(t *testing.T) {
 	e := newEnv(t, nil)
-	e.block = func(r *http.Request) bool { return r.URL.Query().Get("msg") == "timeout" }
+	e.setBlock(func(r *http.Request) bool { return r.URL.Query().Get("msg") == "timeout" })
 	// ok, non-2xx, timeout, refused by rule, refused at dial.
 	e.p.Enqueue(up("ok"))
 	e.p.Drain(context.Background())
-	e.status = 500
+	e.setResponse(500, `{"ok":true}`)
 	e.p.Enqueue(up("non2xx"))
 	e.p.Drain(context.Background())
 	e.p.Enqueue(down("slow", "timeout"))
@@ -408,7 +426,7 @@ func TestCoalesceSameState20s(t *testing.T) {
 
 func TestLatestWinsReplacesPending(t *testing.T) {
 	e := newEnv(t, nil)
-	e.block = func(r *http.Request) bool { return r.URL.Query().Get("status") == "up" }
+	e.setBlock(func(r *http.Request) bool { return r.URL.Query().Get("status") == "up" })
 	ctx, cancel := context.WithCancel(context.Background())
 	done := e.start(ctx)
 	e.p.Enqueue(up("a"))
@@ -431,7 +449,7 @@ func TestLatestWinsReplacesPending(t *testing.T) {
 
 func TestTimeoutFailed(t *testing.T) {
 	e := newEnv(t, nil)
-	e.block = func(r *http.Request) bool { return r.URL.Query().Get("msg") == "timeout" }
+	e.setBlock(func(r *http.Request) bool { return r.URL.Query().Get("msg") == "timeout" })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := e.start(ctx)
@@ -480,7 +498,7 @@ func TestRunReturnsAfterWorkerExits(t *testing.T) {
 		t.Fatal("idle Run did not return on cancel")
 	}
 
-	e.block = func(*http.Request) bool { return true }
+	e.setBlock(func(*http.Request) bool { return true })
 	ctx, cancel = context.WithCancel(context.Background())
 	done = e.start(ctx)
 	e.p.Enqueue(up("a"))
@@ -500,7 +518,7 @@ func TestRunReturnsAfterWorkerExits(t *testing.T) {
 
 func TestStopDoesNotAbortInflightPush(t *testing.T) {
 	e := newEnv(t, nil)
-	e.block = func(*http.Request) bool { return true }
+	e.setBlock(func(*http.Request) bool { return true })
 	ctx, cancel := context.WithCancel(context.Background())
 	done := e.start(ctx)
 	e.p.Enqueue(up("a"))
@@ -530,7 +548,7 @@ func TestDrainStopsWhenUnderOneSecondLeft(t *testing.T) {
 // deadline sits just above it.
 func TestDrainHonoursDeadlineDuringSlowPush(t *testing.T) {
 	e := newEnv(t, func(c *Config) { c.Timeout = 5 * time.Second })
-	e.block = func(*http.Request) bool { return true }
+	e.setBlock(func(*http.Request) bool { return true })
 	e.p.Enqueue(up("a"))
 	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
 	defer cancel()
@@ -560,7 +578,7 @@ func TestForgetConcurrentWithSend(t *testing.T) {
 
 func TestDrainAfterRunDeliversPending(t *testing.T) {
 	e := newEnv(t, nil)
-	e.block = func(r *http.Request) bool { return r.URL.Query().Get("status") == "up" }
+	e.setBlock(func(r *http.Request) bool { return r.URL.Query().Get("status") == "up" })
 	ctx, cancel := context.WithCancel(context.Background())
 	done := e.start(ctx)
 	e.p.Enqueue(up("a"))
@@ -572,17 +590,36 @@ func TestDrainAfterRunDeliversPending(t *testing.T) {
 	e.nextReq() // a
 	e.noReq()
 
-	cancelled, c2 := context.WithCancel(context.Background())
-	c2()
-	e.p.Drain(cancelled)
-	e.noReq()
-
 	dctx, c3 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer c3()
 	e.p.Drain(dctx)
 	if q := e.nextReq(); q.Get("status") != "down" {
 		t.Fatalf("drained push = %v", q)
 	}
+}
+
+// Pushes Drain leaves behind (ctx over) are sent nowhere, counted failed and
+// logged once, without the URL.
+func TestDrainCountsLeftoversFailed(t *testing.T) {
+	e := newEnv(t, nil)
+	e.p.Enqueue(up("a"))
+	e.p.Enqueue(down("b", "failed"))
+	cancelled, c2 := context.WithCancel(context.Background())
+	c2()
+	e.p.Drain(cancelled)
+	e.noReq()
+	if e.result(ResultFailed) != 2 {
+		t.Fatalf("results = %v", e.results)
+	}
+	logs := e.logs.String()
+	if strings.Count(logs, "job pushes dropped at shutdown") != 1 || !strings.Contains(logs, "count=2") {
+		t.Fatalf("logs = %s", logs)
+	}
+	if strings.Contains(logs, token) {
+		t.Fatalf("log echoes the token: %s", logs)
+	}
+	e.p.Drain(context.Background())
+	e.noReq()
 }
 
 func TestBlockedAddressRefusedAtDial(t *testing.T) {

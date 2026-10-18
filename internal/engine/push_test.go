@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -249,7 +250,8 @@ func TestPushAfterUnflushedReplay(t *testing.T) {
 	}
 	h.advance(time.Second)
 	h.waitStatus(r.ID, model.StatusSuccess)
-	if ps := fp.all(); len(ps) != 1 || !ps[0].Up {
+	// PingMs is the run's duration at finalize, not including the replay wait.
+	if ps := fp.all(); len(ps) != 1 || !ps[0].Up || ps[0].PingMs < 0 || ps[0].PingMs >= 1000 {
 		t.Fatalf("pushes after replay = %+v", ps)
 	}
 }
@@ -477,5 +479,94 @@ func TestJobPushSeriesDeletedAfterInflightCompletes(t *testing.T) {
 	h.advance(61 * time.Second) // past reconcileEvery
 	if n := pushSeries(t, m, "tick"); n != 0 {
 		t.Fatalf("%d plr_job_push_total series left for a deleted job", n)
+	}
+}
+
+func TestUpdateRefMissing400(t *testing.T) {
+	h := newHarness(t, withSecrets(&mapSecrets{vals: map[string]string{"Svc/KUMA": "x"}}))
+	j := h.create(invokeJob("f", pushPolicy(nil)))
+	_, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Policy: &model.PolicyIn{PushURLRef: ptr("Svc/NOPE")}})
+	if fe := fieldErrOf(t, err); fe.Field != "policy.push_url_ref" || fe.Code != "secret_ref_missing" {
+		t.Fatalf("err = %+v", fe)
+	}
+}
+
+func TestValidateRefMissing400(t *testing.T) {
+	h := newHarness(t, withSecrets(&mapSecrets{vals: map[string]string{}}))
+	_, err := h.e.ValidateJob(context.Background(), h.owner, invokeJob("f", pushPolicy(nil)))
+	if fe := fieldErrOf(t, err); fe.Field != "policy.push_url_ref" || fe.Code != "secret_ref_missing" {
+		t.Fatalf("err = %+v", fe)
+	}
+}
+
+func TestPatchDirectToAtWithKeptRefRefused(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(cronJob("tick", "* * * * *", pushPolicy(nil)))
+	at := t0.Add(time.Hour)
+	_, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Trigger: &model.TriggerIn{Type: model.TriggerAt, At: &at}})
+	if fe := fieldErrOf(t, err); fe.Field != "policy.push_url_ref" || fe.Code != "invalid" {
+		t.Fatalf("err = %+v", fe)
+	}
+}
+
+func TestPatchPushRefNullKeepsStored(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("f", pushPolicy(nil)))
+	var patch model.JobPatch
+	if err := json.Unmarshal([]byte(`{"policy":{"push_url_ref":null,"timeout_sec":45}}`), &patch); err != nil {
+		t.Fatal(err)
+	}
+	got, err := h.e.UpdateJob(context.Background(), j.ID, patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Policy.PushURLRef != "Svc/KUMA" {
+		t.Fatalf("null must keep the stored ref: %+v", got.Policy)
+	}
+}
+
+func TestPatchChangingRefForgetsCoalescing(t *testing.T) {
+	fp := &fakePusher{}
+	h := newHarness(t, withPusher(fp))
+	j := h.create(invokeJob("f", pushPolicy(nil)))
+	if _, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Name: ptr("g")}); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+	if fp.forgot(j.ID) {
+		t.Fatal("a PATCH that keeps the ref must not reset push state")
+	}
+	if _, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Policy: &model.PolicyIn{PushURLRef: ptr("Svc/KUMA2")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+	if !fp.forgot(j.ID) {
+		t.Fatal("a PATCH that changes the ref must reset push state")
+	}
+}
+
+// Runs finalized by boot recovery push like any other terminal write.
+func TestBootInterruptedPushesDown(t *testing.T) {
+	fp := &fakePusher{}
+	h := newHarness(t, withPusher(fp))
+	amo := h.create(invokeJob("amo", pushPolicy(&model.PolicyIn{Delivery: ptr(model.AtMostOnce)})))
+	in := asyncJob("asy")
+	in.Policy = pushPolicy(nil)
+	asy := h.create(in)
+	h.stop()
+	rAMO := insertRunning(t, h, amo, model.KindInvoke, t0, nil)
+	rEarly := insertRunning(t, h, asy, model.KindInvoke, t0, &model.CompleteReq{Status: "success"})
+	h.start()
+	h.waitStatus(rAMO.ID, model.StatusInterrupted)
+	h.waitStatus(rEarly.ID, model.StatusSuccess)
+	byRun := map[string]jobpush.Push{}
+	for _, p := range fp.all() {
+		byRun[p.RunID] = p
+	}
+	if p, ok := byRun[rAMO.ID]; !ok || p.Up || p.Status != "interrupted" {
+		t.Fatalf("interrupted push = %+v (all %+v)", p, fp.all())
+	}
+	if p, ok := byRun[rEarly.ID]; !ok || !p.Up || p.PingMs < 0 {
+		t.Fatalf("early-result push = %+v (all %+v)", p, fp.all())
 	}
 }

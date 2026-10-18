@@ -37,6 +37,7 @@ type outcome struct {
 	successor       *model.Run
 	page            bool
 	pageTitle       string
+	finishedAt      time.Time // set by finalize; afterFinalize may run later (unflushed replay)
 }
 
 func newID() string {
@@ -120,6 +121,7 @@ func truncate(s string, n int) string {
 // guarded transition loses, nothing else happens. It returns whether it won.
 func (e *Engine) finalize(r model.Run, from []model.Status, o outcome) bool {
 	now := e.now()
+	o.finishedAt = now
 	var je *jobEntry
 	if r.JobID != "" {
 		je = e.jobs[r.JobID]
@@ -265,7 +267,7 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		switch {
 		case o.status == model.StatusSuccess:
 			if r.StartedAt != nil {
-				x.PingMs = e.now().Sub(*r.StartedAt).Milliseconds()
+				x.PingMs = o.finishedAt.Sub(*r.StartedAt).Milliseconds()
 			}
 			x.Up, x.Status = true, "up"
 			e.d.Pusher.Enqueue(x)

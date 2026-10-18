@@ -378,6 +378,7 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 	case err != nil:
 		e.log.Error("reload job", "job", v.jobID, "err", err)
 	default:
+		e.forgetOnRefChange(e.jobs[j.ID], j)
 		e.jobs[j.ID] = newJobEntry(j, e.now())
 	}
 	if !gone {
@@ -411,6 +412,14 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 	}
 	for _, r := range v.inserted {
 		e.pushRun(r)
+	}
+}
+
+// forgetOnRefChange resets the job's push state when its push ref changes, so
+// the first ping to the new monitor is not coalesced away by the old one's.
+func (e *Engine) forgetOnRefChange(old *jobEntry, j model.Job) {
+	if e.d.Pusher != nil && old != nil && old.job.Policy.PushURLRef != j.Policy.PushURLRef {
+		e.d.Pusher.Forget(j.ID)
 	}
 }
 

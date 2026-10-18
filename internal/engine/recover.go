@@ -270,6 +270,7 @@ func (e *Engine) reconcile(now time.Time) {
 	}
 	fresh := make(map[string]*jobEntry, len(jobs))
 	for _, j := range jobs {
+		e.forgetOnRefChange(e.jobs[j.ID], j)
 		fresh[j.ID] = newJobEntry(j, now)
 	}
 	old := e.jobs

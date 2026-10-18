@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/metrics"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
@@ -127,12 +126,6 @@ type harness struct {
 	secrets        SecretSource
 	pushHosts      []string
 	callbackPolicy secure.IPPolicy
-}
-
-// Pusher is the engine's view of jobpush.Pusher.
-type Pusher = interface {
-	Enqueue(jobpush.Push)
-	Forget(jobID string)
 }
 
 type opt func(*harness)

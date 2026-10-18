@@ -97,12 +97,16 @@ type Deps struct {
 	// it to the resolved callback host. nil skips that check.
 	CallbackPolicy secure.IPPolicy
 	// Pusher delivers per-job Kuma pushes off the loop; nil disables them.
-	Pusher interface {
-		Enqueue(jobpush.Push)
-		Forget(jobID string)
-	}
+	Pusher Pusher
 	// PushHosts is PUSH_URL_HOSTS, for the validate checks.
 	PushHosts []string
+}
+
+// Pusher is the engine's view of jobpush.Pusher.
+type Pusher interface {
+	Enqueue(jobpush.Push)
+	// Forget drops a job's waiting push and its coalescing record.
+	Forget(jobID string)
 }
 
 type held struct {
