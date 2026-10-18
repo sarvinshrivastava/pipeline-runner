@@ -424,6 +424,35 @@ func TestCoalesceSameState20s(t *testing.T) {
 	}
 }
 
+// Coalescing is per (job, ref): a job pointed at a new monitor gets its first
+// same-state ping through at once, while the same ref still coalesces.
+func TestCoalesceScopedToRef(t *testing.T) {
+	e := newEnv(t, nil)
+	e.secrets.vals["Root/KUMA2"] = e.base + "/api/push/Second0Token9?status=up&msg=OK&ping="
+	send := func(x Push) {
+		e.p.Enqueue(x)
+		e.p.Drain(context.Background())
+		e.advance(5 * time.Second)
+	}
+	moved := up("a")
+	moved.Ref = "Root/KUMA2"
+	send(up("a"))
+	send(moved)
+	if len(e.reqs) != 2 || e.result(ResultCoalesced) != 0 {
+		t.Fatalf("up to a new ref within 20 s must be sent: %d requests, results %v", len(e.reqs), e.results)
+	}
+	send(moved)
+	if len(e.reqs) != 2 || e.result(ResultCoalesced) != 1 {
+		t.Fatalf("same ref, same state must coalesce: %d requests, results %v", len(e.reqs), e.results)
+	}
+	e.p.Forget("a")
+	send(up("a"))
+	send(moved)
+	if len(e.reqs) != 4 {
+		t.Fatalf("Forget must clear every ref's record: %d requests", len(e.reqs))
+	}
+}
+
 func TestLatestWinsReplacesPending(t *testing.T) {
 	e := newEnv(t, nil)
 	e.setBlock(func(r *http.Request) bool { return r.URL.Query().Get("status") == "up" })

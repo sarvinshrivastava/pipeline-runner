@@ -11,11 +11,14 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sarvinshrivastava/pipeline-runner/internal/config"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 )
 
 const pushToken = "Tok3nSecretXYZ"
@@ -162,12 +165,21 @@ func TestServeWiresJobPush(t *testing.T) {
 	tok, job := rig.pushJob("tick", "http://127.0.0.1:"+port(t, tgt)+"/hook")
 
 	// The engine got PUSH_URL_HOSTS too: validate passes the push_url check.
-	checks := map[string]bool{}
-	for _, c := range rig.call("POST", "/v1/jobs/"+job+"/validate", tok, nil)["checks"].([]any) {
-		m := c.(map[string]any)
-		checks[m["name"].(string)], _ = m["ok"].(bool)
+	resp := rig.call("POST", "/v1/jobs/"+job+"/validate", tok, nil)
+	cs, ok := resp["checks"].([]any)
+	if !ok {
+		t.Fatalf("validate = %v", resp)
 	}
-	if !checks["push_url_ref"] || !checks["push_url"] {
+	checks := map[string]bool{}
+	for _, c := range cs {
+		m, ok := c.(map[string]any)
+		name, nok := m["name"].(string)
+		if !ok || !nok {
+			t.Fatalf("validate check = %v", c)
+		}
+		checks[name], _ = m["ok"].(bool)
+	}
+	if !checks["push_url_ref"] || !checks["push_url"] || !checks["push_dns"] {
 		t.Fatalf("validate push checks = %v", checks)
 	}
 
@@ -199,6 +211,11 @@ func TestServeWiresJobPush(t *testing.T) {
 // At shutdown the pager drain starts at once; it is not held up by the push
 // worker finishing a push that is stuck in flight.
 func TestShutdownPagerDrainNotDelayedByPushJoin(t *testing.T) {
+	// Hold push A far beyond the 2 s window below: with the production 3 s
+	// HTTP timeout, a serial drain could still squeeze page B in under 2 s.
+	oldHTTP, oldBudget := pushHTTPTimeout, pushBudget
+	pushHTTPTimeout, pushBudget = 30*time.Second, 30*time.Second
+	t.Cleanup(func() { pushHTTPTimeout, pushBudget = oldHTTP, oldBudget })
 	pages := make(chan string, 10)
 	var first atomic.Bool
 	ntfy := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -265,8 +282,9 @@ func TestShutdownPagerDrainNotDelayedByPushJoin(t *testing.T) {
 
 	start := time.Now()
 	rig.cancel()
-	// Well under the push timeout (5 s): if the pager drain waited for the
-	// push worker's join, page B would only arrive once push A timed out.
+	// Push A is held for up to 30 s (released below, after this check): if
+	// the pager drain waited for the push worker's join, page B would miss
+	// this 2 s window by a wide margin.
 	select {
 	case p := <-pages:
 		if !strings.HasPrefix(p, "b:") {
@@ -291,5 +309,35 @@ func TestShutdownPagerDrainNotDelayedByPushJoin(t *testing.T) {
 	}
 	if el := time.Since(start); el > 6*time.Second {
 		t.Fatalf("shutdown took %s", el)
+	}
+}
+
+// On an early return (start or listen failure) the deferred join still
+// drains what boot recovery queued, instead of dropping it uncounted.
+func TestJoinPushDrainsOnEarlyReturn(t *testing.T) {
+	var mu sync.Mutex
+	results := map[string]int{}
+	p := jobpush.New(jobpush.Config{
+		Clients: func(context.Context, string) (model.Principal, error) { return model.Principal{}, jobpush.ErrClientGone },
+		Hosts:   []string{"localhost"},
+		Count: func(_, _, r string) {
+			mu.Lock()
+			results[r]++
+			mu.Unlock()
+		},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	p.Enqueue(jobpush.Push{JobID: "j", JobName: "j", ClientID: "c", RunID: "r", Ref: "Svc/KUMA", Status: "interrupted", PingMs: -1})
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	close(done) // the worker never ran: Start failed before it popped anything
+	joinPush(stop, done, p)
+	if ctx.Err() == nil {
+		t.Fatal("joinPush must stop the worker")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if results[jobpush.ResultRefused] != 1 || len(results) != 1 {
+		t.Fatalf("results = %v, want the queued push handled once", results)
 	}
 }

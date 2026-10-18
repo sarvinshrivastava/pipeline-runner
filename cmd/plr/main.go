@@ -44,6 +44,14 @@ var version = "dev"
 // replaces it (to reach a loopback receiver).
 var callbackPolicy secure.IPPolicy = secure.IPAllowed
 
+// Job push limits: the HTTP client timeout and the per-push budget (client
+// lookup, vault read and the GET). Variables so serve tests can hold a push
+// in flight longer than the shutdown windows they measure.
+var (
+	pushHTTPTimeout = 3 * time.Second
+	pushBudget      = 5 * time.Second
+)
+
 func main() {
 	cmd := "serve"
 	if len(os.Args) > 1 {
@@ -137,16 +145,17 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	})
 	pusher := jobpush.New(jobpush.Config{
 		Secrets: vc, Clients: storeClients(st), Hosts: cfg.PushURLHosts,
-		HTTP:  secure.NewHTTPClient(3*time.Second, callbackPolicy),
+		HTTP: secure.NewHTTPClient(pushHTTPTimeout, callbackPolicy), Timeout: pushBudget,
 		Count: m.AddJobPush, Log: log, Now: time.Now,
 	})
 	// The push worker starts before eng.Start: boot recovery finalizes runs
 	// inside Start. The defer, registered after st.Close's, joins it before
-	// the store closes on every return path.
+	// the store closes on every return path, and drains what an early return
+	// (start or listen failure) left queued.
 	pushCtx, stopPush := context.WithCancel(context.Background())
 	pushDone := make(chan struct{})
 	go func() { defer close(pushDone); pusher.Run(pushCtx) }()
-	defer func() { stopPush(); <-pushDone }()
+	defer joinPush(stopPush, pushDone, pusher)
 
 	executors := map[string]target.Executor{
 		model.TargetHTTP: httpt.New(secure.NewHTTPClient(10*time.Second, callbackPolicy)),
@@ -234,6 +243,21 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	go func() { defer wg.Done(); stopPush(); <-pushDone; pusher.Drain(drainCtx) }()
 	wg.Wait()
 	return runErr
+}
+
+// jobpush cannot import engine (engine imports jobpush), so the interface
+// check lives here.
+var _ engine.Pusher = (*jobpush.Pusher)(nil)
+
+// joinPush stops the push worker, waits for it, then drains what is still
+// queued: a no-op after a normal shutdown (already drained), and on an early
+// return it delivers, or counts as failed, the pushes boot recovery queued.
+func joinPush(stop context.CancelFunc, done <-chan struct{}, p *jobpush.Pusher) {
+	stop()
+	<-done
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p.Drain(ctx)
 }
 
 // storeClients looks up a push's owning client for its current prefixes.

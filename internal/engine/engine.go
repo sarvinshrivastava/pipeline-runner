@@ -105,7 +105,7 @@ type Deps struct {
 // Pusher is the engine's view of jobpush.Pusher.
 type Pusher interface {
 	Enqueue(jobpush.Push)
-	// Forget drops a job's waiting push and its coalescing record.
+	// Forget drops a deleted job's waiting push and its coalescing records.
 	Forget(jobID string)
 }
 

@@ -85,6 +85,23 @@ func TestPushOnSuccess(t *testing.T) {
 	}
 }
 
+// PingMs is the run's real duration: start to finalize on the engine clock.
+func TestPushPingMsIsRunDuration(t *testing.T) {
+	fp := &fakePusher{}
+	h := newHarness(t, withPusher(fp))
+	g := newGate()
+	h.exec.set(g.behaviour(okResult()))
+	j := h.create(invokeJob("f", pushPolicy(nil)))
+	r := invoke(t, h, j.ID)
+	h.waitStatus(r.ID, model.StatusRunning)
+	h.advance(3 * time.Second)
+	g.open()
+	h.waitStatus(r.ID, model.StatusSuccess)
+	if ps := fp.all(); len(ps) != 1 || !ps[0].Up || ps[0].PingMs != 3000 {
+		t.Fatalf("pushes = %+v, want one up with PingMs 3000", ps)
+	}
+}
+
 func TestNoPushWhenRefUnset(t *testing.T) {
 	fp := &fakePusher{}
 	h := newHarness(t, withPusher(fp))
@@ -525,23 +542,24 @@ func TestPatchPushRefNullKeepsStored(t *testing.T) {
 	}
 }
 
-func TestPatchChangingRefForgetsCoalescing(t *testing.T) {
+// A ref change is not a reset: the pusher scopes coalescing by (job, ref),
+// so the engine only has to enqueue the current ref and never Forgets.
+func TestPatchChangingRefPushesNewRef(t *testing.T) {
 	fp := &fakePusher{}
 	h := newHarness(t, withPusher(fp))
 	j := h.create(invokeJob("f", pushPolicy(nil)))
-	if _, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Name: ptr("g")}); err != nil {
-		t.Fatal(err)
-	}
-	h.sync()
-	if fp.forgot(j.ID) {
-		t.Fatal("a PATCH that keeps the ref must not reset push state")
-	}
+	h.waitStatus(invoke(t, h, j.ID).ID, model.StatusSuccess)
 	if _, err := h.e.UpdateJob(context.Background(), j.ID, model.JobPatch{Policy: &model.PolicyIn{PushURLRef: ptr("Svc/KUMA2")}}); err != nil {
 		t.Fatal(err)
 	}
 	h.sync()
-	if !fp.forgot(j.ID) {
-		t.Fatal("a PATCH that changes the ref must reset push state")
+	h.waitStatus(invoke(t, h, j.ID).ID, model.StatusSuccess)
+	ps := fp.all()
+	if len(ps) != 2 || ps[0].Ref != "Svc/KUMA" || ps[1].Ref != "Svc/KUMA2" {
+		t.Fatalf("pushes = %+v", ps)
+	}
+	if fp.forgot(j.ID) {
+		t.Fatal("a ref change must not Forget: only deletes do")
 	}
 }
 

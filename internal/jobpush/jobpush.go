@@ -79,7 +79,7 @@ type Pusher struct {
 	mu        sync.Mutex
 	pending   map[string]Push    // jobID → latest waiting push
 	order     []string           // jobIDs in the arrival order of their waiting push
-	sent      map[string]attempt // jobID → last attempted state and time
+	sent      map[sentKey]attempt // (job, ref) → last attempted state and time
 	lastSweep time.Time
 	wake      chan struct{} // cap 1
 }
@@ -88,6 +88,10 @@ type attempt struct {
 	up bool
 	at time.Time
 }
+
+// sentKey scopes coalescing to one monitor: a push to a new ref is never
+// skipped because of the old ref's last attempt.
+type sentKey struct{ job, ref string }
 
 // New returns a pusher; call Run to start delivering.
 func New(cfg Config) *Pusher {
@@ -103,7 +107,7 @@ func New(cfg Config) *Pusher {
 	return &Pusher{
 		cfg:     cfg,
 		pending: map[string]Push{},
-		sent:    map[string]attempt{},
+		sent:    map[sentKey]attempt{},
 		wake:    make(chan struct{}, 1),
 	}
 }
@@ -128,12 +132,16 @@ func (p *Pusher) Enqueue(x Push) {
 	}
 }
 
-// Forget drops a deleted job's waiting push and attempt record. order is
-// cleaned lazily: a pop skips IDs no longer pending.
+// Forget drops a deleted job's waiting push and its attempt records for every
+// ref. order is cleaned lazily: a pop skips IDs no longer pending.
 func (p *Pusher) Forget(jobID string) {
 	p.mu.Lock()
 	delete(p.pending, jobID)
-	delete(p.sent, jobID)
+	for k := range p.sent {
+		if k.job == jobID {
+			delete(p.sent, k)
+		}
+	}
 	p.mu.Unlock()
 }
 
@@ -219,26 +227,28 @@ func (p *Pusher) popLocked() (Push, bool) {
 	return Push{}, false
 }
 
-// sendOne skips a push whose state matches the job's last attempted one
-// within the coalescing window; a change of state is always sent.
+// sendOne skips a push whose state matches the last one attempted for the
+// same job and ref within the coalescing window; a change of state, or a
+// different ref, is always sent.
 func (p *Pusher) sendOne(ctx context.Context, x Push) {
 	now := p.cfg.Now()
 	p.mu.Lock()
 	if now.Sub(p.lastSweep) >= sweepEvery {
-		for id, a := range p.sent {
+		for k, a := range p.sent {
 			if now.Sub(a.at) > sentTTL {
-				delete(p.sent, id)
+				delete(p.sent, k)
 			}
 		}
 		p.lastSweep = now
 	}
-	if a, ok := p.sent[x.JobID]; ok && a.up == x.Up && now.Sub(a.at) < coalesceWindow {
+	key := sentKey{x.JobID, x.Ref}
+	if a, ok := p.sent[key]; ok && a.up == x.Up && now.Sub(a.at) < coalesceWindow {
 		p.mu.Unlock()
 		p.count(x, ResultCoalesced)
 		return
 	}
 	// Recorded on attempt, whatever the result.
-	p.sent[x.JobID] = attempt{up: x.Up, at: now}
+	p.sent[key] = attempt{up: x.Up, at: now}
 	p.mu.Unlock()
 	p.count(x, p.deliver(ctx, x))
 }

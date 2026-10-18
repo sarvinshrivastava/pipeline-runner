@@ -228,6 +228,13 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 	r.Status = o.status
 	r.Error = o.err
 
+	// The run's end is finalize's clock, not now: an unflushed replay can run
+	// afterFinalize long after the run finished.
+	finished := o.finishedAt
+	if finished.IsZero() {
+		finished = e.now()
+	}
+
 	je := e.jobs[r.JobID]
 	if je != nil {
 		if jobDone {
@@ -246,7 +253,7 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 	if m := e.d.Metrics; m != nil {
 		m.RunsTotal.WithLabelValues(r.JobName, r.ClientID, string(o.status)).Inc()
 		if r.StartedAt != nil {
-			m.RunDuration.WithLabelValues(r.JobName, r.ClientID).Observe(e.now().Sub(*r.StartedAt).Seconds())
+			m.RunDuration.WithLabelValues(r.JobName, r.ClientID).Observe(finished.Sub(*r.StartedAt).Seconds())
 		}
 		if o.status == model.StatusSkipped {
 			m.SkippedTotal.WithLabelValues(r.JobName).Inc()
@@ -267,7 +274,7 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		switch {
 		case o.status == model.StatusSuccess:
 			if r.StartedAt != nil {
-				x.PingMs = o.finishedAt.Sub(*r.StartedAt).Milliseconds()
+				x.PingMs = finished.Sub(*r.StartedAt).Milliseconds()
 			}
 			x.Up, x.Status = true, "up"
 			e.d.Pusher.Enqueue(x)
