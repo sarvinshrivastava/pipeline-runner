@@ -290,7 +290,7 @@ func (e *Engine) reconcile(now time.Time) {
 		for _, je := range fresh {
 			live[[2]string{je.job.Name, je.job.ClientID}] = true
 		}
-		m.SweepCoalesced(func(job, client string) bool { return live[[2]string{job, client}] })
+		m.SweepJobSeries(func(job, client string) bool { return live[[2]string{job, client}] })
 	}
 
 	pending, err := store.RunsByStatus(ctx, e.st.R, model.StatusPending)
