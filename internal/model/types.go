@@ -143,19 +143,30 @@ type Policy struct {
 	MaxDeferSec      int64       `json:"max_defer_sec"`
 	NotifyOnSuccess  bool        `json:"notify_on_success"`
 	Priority         string      `json:"priority"`
+	// PushURLRef names a vault secret holding an Uptime Kuma push URL, pinged
+	// after each terminal run of the job.
+	PushURLRef string `json:"push_url_ref,omitempty"`
+	// PushOnFailure also pushes status=down after a final failure.
+	PushOnFailure bool `json:"push_on_failure"`
 }
 
 type policyAlias Policy
 
-// UnmarshalJSON reads policies stored before priority existed as normal.
+// UnmarshalJSON reads policies stored before priority existed as normal, and
+// those stored before push_on_failure existed (or with null) as true.
 func (p *Policy) UnmarshalJSON(b []byte) error {
-	var a policyAlias
-	if err := json.Unmarshal(b, &a); err != nil {
+	var s struct {
+		policyAlias
+		PushOnFailure *bool `json:"push_on_failure"`
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
 		return err
 	}
+	a := s.policyAlias
 	if a.Priority == "" {
 		a.Priority = PriorityNormal
 	}
+	a.PushOnFailure = s.PushOnFailure == nil || *s.PushOnFailure
 	*p = Policy(a)
 	return nil
 }

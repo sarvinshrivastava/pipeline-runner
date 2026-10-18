@@ -389,3 +389,167 @@ func TestLegacyPolicyReadsAsNormalAndPatches(t *testing.T) {
 		}
 	}
 }
+
+func pushJob(ref string) JobCreate {
+	in := httpJob()
+	in.Policy = &PolicyIn{PushURLRef: ptr(ref)}
+	return in
+}
+
+func rootCtx() VCtx {
+	c := ctx()
+	c.Principal.SecretRefPrefixes = []string{"Root/", "ReelDrop/"}
+	return c
+}
+
+func fieldOf(t *testing.T, err error) (field, code string) {
+	t.Helper()
+	fe, ok := AsFieldError(err)
+	if !ok {
+		t.Fatalf("not a FieldError: %v", err)
+	}
+	return fe.Field, fe.Code
+}
+
+func TestPushURLRefCanonicalAndPrefix(t *testing.T) {
+	j, err := ValidateJobCreate(pushJob(" KUMA_PUSH "), rootCtx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Policy.PushURLRef != "Root/KUMA_PUSH" || !j.Policy.PushOnFailure {
+		t.Fatalf("policy = %+v", j.Policy)
+	}
+	f, c := fieldOf(t, mustErr(ValidateJobCreate(pushJob("Other/KUMA"), ctx())))
+	if f != "policy.push_url_ref" || c != "secret_ref_not_permitted" {
+		t.Fatalf("outside prefixes: %s %s", f, c)
+	}
+	f, c = fieldOf(t, mustErr(ValidateJobCreate(pushJob("Root/PIPELINE_RUNNER_X"), rootCtx())))
+	if f != "policy.push_url_ref" || c != "secret_ref_not_permitted" {
+		t.Fatalf("runner key: %s %s", f, c)
+	}
+	j, err = ValidateJobCreate(pushJob("  "), ctx())
+	if err != nil || j.Policy.PushURLRef != "" {
+		t.Fatalf("blank ref must mean unset: %+v %v", j.Policy, err)
+	}
+}
+
+func TestPushURLRefAdhocRefused(t *testing.T) {
+	in := AdhocReq{Target: httpJob().Target, Policy: &PolicyIn{PushURLRef: ptr("ReelDrop/KUMA")}}
+	f, c := fieldOf(t, mustErr(ValidateAdhoc(in, ctx())))
+	if f != "policy.push_url_ref" || c != "invalid" {
+		t.Fatalf("%s %s", f, c)
+	}
+}
+
+func TestAdhocIgnoresPushOnFailure(t *testing.T) {
+	j, err := ValidateJobCreate(httpJob(), ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.Policy.PushOnFailure = false
+	b, _ := json.Marshal(j.Policy)
+	var pin PolicyIn
+	if err := json.Unmarshal(b, &pin); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := ValidateAdhoc(AdhocReq{Target: httpJob().Target, Policy: &pin}, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !spec.Policy.PushOnFailure {
+		t.Fatal("ad-hoc push_on_failure must be forced to the default")
+	}
+}
+
+func TestPushRefRefusedOnAtTrigger(t *testing.T) {
+	in := pushJob("ReelDrop/KUMA")
+	at := testNow.Add(time.Hour)
+	in.Trigger = TriggerIn{Type: TriggerAt, At: &at}
+	f, c := fieldOf(t, mustErr(ValidateJobCreate(in, ctx())))
+	if f != "policy.push_url_ref" || c != "invalid" {
+		t.Fatalf("create at: %s %s", f, c)
+	}
+	cur, err := ValidateJobCreate(pushJob("ReelDrop/KUMA"), ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = ValidatePatch(cur, JobPatch{Trigger: &TriggerIn{Type: TriggerDelay, DelaySec: ptr(int64(60))}}, ctx())
+	f, c = fieldOf(t, err)
+	if f != "policy.push_url_ref" || c != "invalid" {
+		t.Fatalf("patch to delay: %s %s", f, c)
+	}
+}
+
+func TestPatchKeepsPushFields(t *testing.T) {
+	in := pushJob("ReelDrop/KUMA")
+	in.Policy.PushOnFailure = ptr(false)
+	cur, err := ValidateJobCreate(in, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt := httpJob().Target
+	tgt.HTTP.URL = "http://reel-drop:3000/internal/other"
+	next, _, err := ValidatePatch(cur, JobPatch{Target: &tgt}, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Policy.PushURLRef != "ReelDrop/KUMA" || next.Policy.PushOnFailure {
+		t.Fatalf("target-only patch dropped push fields: %+v", next.Policy)
+	}
+}
+
+func TestPatchPolicyKeepsPushFieldsWhenOmitted(t *testing.T) {
+	in := pushJob("ReelDrop/KUMA")
+	in.Policy.PushOnFailure = ptr(false)
+	cur, err := ValidateJobCreate(in, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p JobPatch
+	if err := json.Unmarshal([]byte(`{"policy":{"timeout_sec":60}}`), &p); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := ValidatePatch(cur, p, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Policy.PushURLRef != "ReelDrop/KUMA" || next.Policy.PushOnFailure || next.Policy.TimeoutSec != 60 {
+		t.Fatalf("omitted push fields not kept: %+v", next.Policy)
+	}
+	if p.Policy.PushURLRef != nil || p.Policy.PushOnFailure != nil {
+		t.Fatal("the caller's patch must not be mutated")
+	}
+	p = JobPatch{}
+	if err := json.Unmarshal([]byte(`{"policy":{"push_url_ref":""}}`), &p); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err = ValidatePatch(cur, p, ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Policy.PushURLRef != "" {
+		t.Fatalf("explicit empty ref must clear: %+v", next.Policy)
+	}
+}
+
+func TestPolicyDecodeDefaultsPushOnFailure(t *testing.T) {
+	var p Policy
+	if err := json.Unmarshal([]byte(`{"timeout_sec":30}`), &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.PushOnFailure || p.Priority != PriorityNormal || p.TimeoutSec != 30 {
+		t.Fatalf("old row: %+v", p)
+	}
+	p = Policy{}
+	if err := json.Unmarshal([]byte(`{"push_on_failure":false}`), &p); err != nil || p.PushOnFailure {
+		t.Fatalf("explicit false: %+v %v", p, err)
+	}
+	p = Policy{}
+	if err := json.Unmarshal([]byte(`{"push_on_failure":null}`), &p); err != nil || !p.PushOnFailure {
+		t.Fatalf("null: %+v %v", p, err)
+	}
+	var s RunSpec
+	if err := json.Unmarshal([]byte(`{"target":{"type":"http"},"policy":{"timeout_sec":5}}`), &s); err != nil || !s.Policy.PushOnFailure {
+		t.Fatalf("ad-hoc spec: %+v %v", s.Policy, err)
+	}
+}
