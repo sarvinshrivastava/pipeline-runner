@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 	_ "time/tzdata" // IANA zones must not depend on the image
@@ -24,6 +25,7 @@ import (
 	"github.com/sarvinshrivastava/pipeline-runner/internal/api"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/config"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/engine"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/jobpush"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/metrics"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
@@ -133,6 +135,19 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 		}
 		return eng.LoopAge().Seconds()
 	})
+	pusher := jobpush.New(jobpush.Config{
+		Secrets: vc, Clients: storeClients(st), Hosts: cfg.PushURLHosts,
+		HTTP:  secure.NewHTTPClient(3*time.Second, callbackPolicy),
+		Count: m.AddJobPush, Log: log, Now: time.Now,
+	})
+	// The push worker starts before eng.Start: boot recovery finalizes runs
+	// inside Start. The defer, registered after st.Close's, joins it before
+	// the store closes on every return path.
+	pushCtx, stopPush := context.WithCancel(context.Background())
+	pushDone := make(chan struct{})
+	go func() { defer close(pushDone); pusher.Run(pushCtx) }()
+	defer func() { stopPush(); <-pushDone }()
+
 	executors := map[string]target.Executor{
 		model.TargetHTTP: httpt.New(secure.NewHTTPClient(10*time.Second, callbackPolicy)),
 	}
@@ -143,6 +158,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 		MaxContainers: cfg.MaxContainers, DataDir: cfg.DataDir, RetentionDays: cfg.RunRetentionDays,
 		ContainersEnabled: false, // container/inline targets arrive in delivery 1b
 		CallbackPolicy:    callbackPolicy,
+		Pusher:            pusher, PushHosts: cfg.PushURLHosts,
 	})
 	if err := eng.Start(ctx); err != nil {
 		return fmt.Errorf("start engine: %w", err)
@@ -206,11 +222,32 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger, onReady ready
 	log.Info("api closed")
 	<-done
 	log.Info("engine stopped")
+	// The engine has stopped, so nothing enqueues any more. One 5 s budget
+	// serves both drains; paging starts first and is never delayed by the
+	// push worker's join (at most one push in flight, bounded by its timeout).
 	stopNotify()
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelDrain()
-	pager.Drain(drainCtx)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); pager.Drain(drainCtx) }()
+	go func() { defer wg.Done(); stopPush(); <-pushDone; pusher.Drain(drainCtx) }()
+	wg.Wait()
 	return runErr
+}
+
+// storeClients looks up a push's owning client for its current prefixes.
+func storeClients(st *store.Store) func(context.Context, string) (model.Principal, error) {
+	return func(ctx context.Context, id string) (model.Principal, error) {
+		c, err := store.GetClient(ctx, st.R, id)
+		if errors.Is(err, store.ErrNotFound) {
+			return model.Principal{}, jobpush.ErrClientGone
+		}
+		if err != nil {
+			return model.Principal{}, err
+		}
+		return model.PrincipalOf(c), nil
+	}
 }
 
 func serve(srv *http.Server, ln net.Listener) error {
