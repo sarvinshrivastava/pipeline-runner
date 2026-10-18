@@ -181,6 +181,7 @@ func (h *harness) stop() {
 	defer cancel()
 	h.e.stopLife()
 	<-h.e.done
+	h.e.bg.Wait()
 	_ = ctx
 	h.e = nil
 }

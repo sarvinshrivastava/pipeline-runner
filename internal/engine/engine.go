@@ -151,6 +151,7 @@ type Engine struct {
 	stopOnce sync.Once
 	loopAt   atomic.Int64
 	done     chan struct{}
+	bg       sync.WaitGroup // background goroutines (retention); Stop waits for them
 
 	// Loop-owned state.
 	heap   fireHeap
@@ -245,6 +246,7 @@ func (e *Engine) Stop(ctx context.Context, drainBy time.Time) {
 	e.accepting.Store(false)
 	e.stopLife()
 	<-e.done
+	e.bg.Wait()
 }
 
 // send delivers an event from a non-loop goroutine.
