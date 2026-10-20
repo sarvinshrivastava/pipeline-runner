@@ -26,6 +26,10 @@ A single Go binary (`plr`) with SQLite and an embedded dashboard. Delivery 1a sh
   - `at_least_once` is the default; send `X-PLR-Run-Id` handling for idempotency.
   - `at_most_once` never re-sends an ambiguous request; such runs are paged as **NEEDS A HUMAN**.
   - Retries with backoff are opt-in through `policy.retry`.
+- **Failure pages:**
+  - A job's exhausted failures page once, then at most one summary every 10 minutes (`N more runs failed since the last page …`), then one `recovered` notice. `recovered` goes to the failure topic with a check-mark tag.
+  - The job's other pages (`skipped 3 consecutive runs`, `fired late`, missed) are unchanged. Ad hoc runs, **NEEDS A HUMAN**, `defer cap exceeded` and "run specification missing" still page per run.
+  - After a restart an open failure is remembered from the run history, so it gets no fresh first page.
 - **Callbacks:**
   - In `sync` mode the HTTP response is the result.
   - In `async` mode the target returns 202, then calls `POST /v1/runs/{id}/heartbeat` and `/complete` with the run token it received.
