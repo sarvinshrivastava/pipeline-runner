@@ -374,11 +374,17 @@ func (e *Engine) onJobChanged(v evJobChanged) {
 		delete(e.jobs, v.jobID)
 		delete(e.pageBatch, v.jobID)
 		delete(e.lastMissPage, v.jobID)
+		delete(e.failStates, v.jobID)
 		gone = true
 	case err != nil:
 		e.log.Error("reload job", "job", v.jobID, "err", err)
 	default:
 		e.jobs[j.ID] = newJobEntry(j, e.now())
+		if j.State != model.JobActive {
+			// Disable/done drops paged; held failures still flush once and,
+			// with no state, do not re-arm.
+			delete(e.failStates, j.ID)
+		}
 	}
 	if !gone {
 		e.addPageCounts(v.jobID, v.coalesced, v.expired) // already in the metric (API side)

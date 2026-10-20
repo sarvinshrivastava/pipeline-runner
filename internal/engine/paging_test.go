@@ -11,6 +11,7 @@ import (
 
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/target"
 )
 
@@ -544,4 +545,188 @@ func TestFailureSummaryJoinsMissedCounts(t *testing.T) {
 		h.pager.count("j: missed") != 0 {
 		t.Fatalf("pages = %v, bodies = %q", h.pager.titles(), b)
 	}
+}
+
+func TestRestartMidOutageNoFreshFirstPage(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	f := boom()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	h.stop()
+	h.start()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	b := h.pager.bodies("j: failed")
+	if len(b) != 2 || !strings.Contains(b[1], "1 more run failed") {
+		t.Fatalf("failed bodies = %q", b)
+	}
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	if h.pager.count("j: recovered") != 1 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+}
+
+func TestRestartAfterRecoveryStartsClean(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	f := boom()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	h.stop()
+	h.start()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	b := h.pager.bodies("j: failed")
+	if len(b) != 2 || strings.Contains(b[1], "more run") {
+		t.Fatalf("failed bodies = %q", b)
+	}
+}
+
+func TestRestartAfterNeedsHumanDoesNotArm(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", &model.PolicyIn{Delivery: ptr(model.AtMostOnce)}))
+	h.runOnce(j.ID, failAmbiguous, model.StatusInterrupted)
+	h.stop()
+	h.start()
+	if _, ok := h.failState(j.ID); ok {
+		t.Fatal("a NEEDS A HUMAN failure must not arm recovery at boot")
+	}
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	if h.pager.count("recovered") != 0 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+}
+
+func TestRestartSkipsPerRunClassToFindOpenFailure(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", &model.PolicyIn{Delivery: ptr(model.AtMostOnce)}))
+	h.runOnce(j.ID, boom(), model.StatusFailed)             // plain failure: paged
+	h.runOnce(j.ID, failAmbiguous, model.StatusInterrupted) // NEEDS A HUMAN on top
+	h.stop()
+	h.start()
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	if h.pager.count("j: recovered") != 1 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+}
+
+func TestBootInterruptedPagesCollapse(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", &model.PolicyIn{Delivery: ptr(model.AtMostOnce)}))
+	h.stop()
+	insertRunning(t, h, j, model.KindInvoke, t0, nil)
+	insertRunning(t, h, j, model.KindInvoke, t0, nil)
+	h.start()
+	h.sync()
+	pc, _ := h.batch(j.ID)
+	if h.pager.count("j: interrupted") != 1 || pc.failed != 1 || pc.lastStatus != model.StatusInterrupted {
+		t.Fatalf("pages = %v, held = %+v", h.pager.titles(), pc)
+	}
+}
+
+func TestDeletedJobDropsFailState(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	f := boom()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	h.runOnce(j.ID, f, model.StatusFailed)
+	if err := h.e.DeleteJob(context.Background(), j.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.advance(missPageEvery + time.Second)
+	if n := h.pager.count("j: failed"); n != 1 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	_, hasState := h.failState(j.ID)
+	_, hasBatch := h.batch(j.ID)
+	if hasState || hasBatch {
+		t.Fatalf("state %v, batch %v", hasState, hasBatch)
+	}
+}
+
+func TestDisableDropsPaged(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	f := boom()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	h.runOnce(j.ID, f, model.StatusFailed)
+	setEnabled(t, h, j.ID, false)
+	if _, ok := h.failState(j.ID); ok { // dropped by the reload, not only by reconcile
+		t.Fatal("disable must drop the failure state")
+	}
+	h.advance(missPageEvery + time.Second)
+	if n := h.pager.count("j: failed"); n != 2 {
+		t.Fatalf("held failures flush once after a disable: %v", h.pager.titles())
+	}
+	setEnabled(t, h, j.ID, true)
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	if h.pager.count("recovered") != 0 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	h.runOnce(j.ID, f, model.StatusFailed)
+	b := h.pager.bodies("j: failed")
+	if len(b) != 3 || strings.Contains(b[2], "more run") {
+		t.Fatalf("failed bodies = %q", b)
+	}
+}
+
+func TestReenableInsideWindowNoStaleRecovered(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	f := boom()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	h.runOnce(j.ID, f, model.StatusFailed)
+	setEnabled(t, h, j.ID, false)
+	h.advance(2 * time.Minute)
+	setEnabled(t, h, j.ID, true)
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	if h.pager.count("recovered") != 0 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	h.advance(missPageEvery)
+	if n := h.pager.count("j: failed"); n != 2 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	if h.pager.count("recovered") != 0 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+}
+
+func TestReenableInsideWindowThenFail(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	f := boom()
+	h.runOnce(j.ID, f, model.StatusFailed)
+	h.runOnce(j.ID, f, model.StatusFailed)
+	setEnabled(t, h, j.ID, false)
+	h.advance(2 * time.Minute)
+	setEnabled(t, h, j.ID, true)
+	h.runOnce(j.ID, f, model.StatusFailed)
+	b := h.pager.bodies("j: failed")
+	if len(b) != 2 || !strings.Contains(b[1], "1 more run failed") || !strings.HasPrefix(b[1], "boom-3") {
+		t.Fatalf("failed bodies = %q", b)
+	}
+	if _, ok := h.batch(j.ID); ok {
+		t.Fatal("the immediate page must take the held failures")
+	}
+}
+
+func TestReconcileDropsFailStateOfVanishedJob(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	h.runOnce(j.ID, boom(), model.StatusFailed)
+	if err := store.DeleteJob(context.Background(), h.st.W, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.advance(reconcileEvery)
+	if _, ok := h.failState(j.ID); ok {
+		t.Fatal("reconcile must drop a vanished job's failure state")
+	}
+}
+
+func setEnabled(t *testing.T, h *harness, jobID string, on bool) {
+	t.Helper()
+	if _, err := h.e.SetEnabled(context.Background(), jobID, on); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
 }

@@ -29,6 +29,28 @@ func (e *Engine) Start(ctx context.Context) error {
 	for _, j := range jobs {
 		e.jobs[j.ID] = newJobEntry(j, now)
 	}
+	// Re-derive each active job's open failure from its run history, before
+	// the boot finalizes below page through it (PLR-1).
+	for _, j := range jobs {
+		if j.State != model.JobActive {
+			continue
+		}
+		ends, err := store.RecentChainEnds(ctx, e.st.W, j.ID)
+		if err != nil {
+			// Fail-soft: one extra page beats refusing to boot every job.
+			e.log.Warn("boot: read failure state; the job's next failure pages as new", "job", j.ID, "err", err)
+			continue
+		}
+		for _, end := range ends { // newest first; per-run classes neither open nor close an incident
+			if end.Status == model.StatusSuccess {
+				break
+			}
+			if !perRunError(end.Error) {
+				e.failStates[j.ID] = &failState{paged: true}
+				break
+			}
+		}
+	}
 
 	type redispatch struct {
 		run  model.Run
@@ -291,6 +313,11 @@ func (e *Engine) reconcile(now time.Time) {
 	for id := range e.lastMissPage {
 		if fresh[id] == nil {
 			delete(e.lastMissPage, id)
+		}
+	}
+	for id := range e.failStates {
+		if je := fresh[id]; je == nil || je.job.State != model.JobActive {
+			delete(e.failStates, id)
 		}
 	}
 	if m := e.d.Metrics; m != nil {
