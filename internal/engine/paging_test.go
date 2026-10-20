@@ -477,9 +477,10 @@ func TestStaleSuccessReplayDoesNotRecover(t *testing.T) {
 		h.e.pageBatch[j.ID] = &pageCount{failed: 1, lastStatus: model.StatusFailed}
 		h.e.afterFinalize(r, outcome{status: model.StatusSuccess, finishedAt: now.Add(-time.Second)},
 			false, -1, []model.Status{model.StatusRunning})
-		paged, healed = h.e.failStates[j.ID].paged, h.e.pageBatch[j.ID].healed
+		pc := h.e.pageBatch[j.ID]
+		paged, healed = h.e.failStates[j.ID].paged, pc == nil || pc.healed
 	})
-	if h.pager.count("recovered") != 0 || !paged || healed {
+	if h.pager.count("recovered") != 0 || !paged || healed { // healed: also when the batch was taken
 		t.Fatalf("pages = %v, paged = %v, healed = %v", h.pager.titles(), paged, healed)
 	}
 }
@@ -716,6 +717,9 @@ func TestReconcileDropsFailStateOfVanishedJob(t *testing.T) {
 	h := newHarness(t)
 	j := h.create(invokeJob("j", nil))
 	h.runOnce(j.ID, boom(), model.StatusFailed)
+	if _, ok := h.failState(j.ID); !ok {
+		t.Fatal("precondition: a failure creates the state")
+	}
 	if err := store.DeleteJob(context.Background(), h.st.W, j.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -745,10 +749,14 @@ func TestBootSpecMissingPagesPerRun(t *testing.T) {
 	h := newHarness(t)
 	j := h.create(invokeJob("j", nil))
 	h.stop()
-	insertSpecless(t, h, j)
-	insertSpecless(t, h, j)
+	rs := []model.Run{insertSpecless(t, h, j), insertSpecless(t, h, j)}
 	h.start()
 	h.sync()
+	for _, r := range rs {
+		if got := h.run(r.ID); got.Error != errSpecMissing+" at boot" {
+			t.Fatalf("run %s error = %q", r.ID, got.Error)
+		}
+	}
 	if n := h.pager.count("j: interrupted"); n != 2 {
 		t.Fatalf("pages = %v", h.pager.titles())
 	}
@@ -767,9 +775,12 @@ func TestRestartPerRunClassesDoNotArm(t *testing.T) {
 		end  func(h *harness, j model.Job)
 	}{
 		{"defer cap", invokeJob("j", &model.PolicyIn{MaxDeferSec: ptr(int64(3600))}), func(h *harness, j model.Job) {
-			h.runOnce(j.ID, func(context.Context, target.ExecInput) target.Result {
+			got := h.runOnce(j.ID, func(context.Context, target.ExecInput) target.Result {
 				return target.Result{DeferUntil: &until, HTTPStatus: code(200)}
 			}, model.StatusFailed)
+			if !strings.HasPrefix(got.Error, errDeferCap) {
+				h.t.Fatalf("error = %q", got.Error)
+			}
 		}},
 		{"lease expired at_least_once", asyncJob("j"), func(h *harness, j model.Job) {
 			h.exec.set(waiting)
@@ -809,6 +820,9 @@ func TestReconcileDropsFailStateOfInactiveJob(t *testing.T) {
 	h := newHarness(t)
 	j := h.create(invokeJob("j", nil))
 	h.runOnce(j.ID, boom(), model.StatusFailed)
+	if _, ok := h.failState(j.ID); !ok {
+		t.Fatal("precondition: a failure creates the state")
+	}
 	if err := store.SetJobState(context.Background(), h.st.W, j.ID, model.JobDisabled, h.clk.Now()); err != nil {
 		t.Fatal(err)
 	}
