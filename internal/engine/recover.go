@@ -144,7 +144,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.lastReconcile = now
 	e.loopAt.Store(now.UnixMilli())
 	go e.loop()
-	go e.retentionLoop()
+	e.bg.Go(e.retentionLoop)
 	return nil
 }
 
