@@ -91,7 +91,7 @@ func (e *Engine) onExecDone(runID string, res target.Result) {
 	}
 	spec, err := e.spec(r)
 	if errors.Is(err, store.ErrNotFound) {
-		e.finalize(r, []model.Status{model.StatusRunning}, outcome{status: model.StatusFailed, err: "run specification missing", page: true})
+		e.finalize(r, []model.Status{model.StatusRunning}, outcome{status: model.StatusFailed, err: errSpecMissing, page: true})
 		return
 	}
 	if err != nil {
@@ -207,7 +207,7 @@ func (e *Engine) onLeaseExpired(runID string, gen uint64) {
 		return
 	}
 	if err != nil {
-		e.finalize(r, []model.Status{model.StatusWaiting}, outcome{status: model.StatusFailed, err: "run specification missing", page: true})
+		e.finalize(r, []model.Status{model.StatusWaiting}, outcome{status: model.StatusFailed, err: errSpecMissing, page: true})
 		return
 	}
 	now := e.now()
@@ -225,7 +225,7 @@ func (e *Engine) onLeaseExpired(runID string, gen uint64) {
 		e.armLease(runID, at)
 		return
 	}
-	o := e.decide(r, spec, target.Result{Status: model.StatusInterrupted, Error: "lease expired without heartbeat or completion", Ambiguous: true, Delivered: true}, now)
+	o := e.decide(r, spec, target.Result{Status: model.StatusInterrupted, Error: errLeaseExpired, Ambiguous: true, Delivered: true}, now)
 	if o.status == model.StatusInterrupted {
 		o.page, o.pageTitle = true, "NEEDS A HUMAN"
 	}

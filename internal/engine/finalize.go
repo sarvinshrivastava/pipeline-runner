@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,28 @@ import (
 )
 
 const maxErrorBytes = 4 << 10
+
+// Per-run failure classes (PLR-1): pages with these errors are never
+// collapsed and never arm recovery. decide, onLeaseExpired, recover.go and the
+// boot derivation share them.
+const (
+	maxSummaryErrBytes = 512
+	errSpecMissing     = "run specification missing"                      // runtime; boot appends " at boot"
+	errNeedsHuman      = "at_most_once request may have been processed: " // decide, prefix
+	errLeaseExpired    = "lease expired without heartbeat or completion"  // onLeaseExpired → NEEDS A HUMAN
+	errDeferCap        = "target asked to defer to "                      // decide, prefix
+)
+
+// perRunError reports whether a failure's error marks a class that pages per
+// run (never collapsed, never arms recovery).
+func perRunError(err string) bool {
+	for _, p := range []string{errSpecMissing, errNeedsHuman, errLeaseExpired, errDeferCap} {
+		if strings.HasPrefix(err, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // maxExpiredCount caps the expired-occurrence count (and the Next calls it
 // takes) per materialise; a page then says "at least".
@@ -64,7 +87,7 @@ func (e *Engine) decide(r model.Run, spec model.RunSpec, res target.Result, now 
 		}
 		if until.Sub(r.OriginFor) > time.Duration(p.MaxDeferSec)*time.Second {
 			o.status, o.page, o.pageTitle = model.StatusFailed, true, "defer cap exceeded"
-			o.err = fmt.Sprintf("target asked to defer to %s, beyond max_defer_sec (%ds) from the original schedule", until.Format(time.RFC3339), p.MaxDeferSec)
+			o.err = fmt.Sprintf(errDeferCap+"%s, beyond max_defer_sec (%ds) from the original schedule", until.Format(time.RFC3339), p.MaxDeferSec)
 			return o
 		}
 		o.status = model.StatusDeferred
@@ -84,7 +107,7 @@ func (e *Engine) decide(r model.Run, spec model.RunSpec, res target.Result, now 
 		canRetry = false
 		if res.Ambiguous {
 			o.status, o.page, o.pageTitle = model.StatusInterrupted, true, "NEEDS A HUMAN"
-			o.err = "at_most_once request may have been processed: " + o.err
+			o.err = errNeedsHuman + o.err
 			return o
 		}
 	}
@@ -257,11 +280,27 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		}
 	}
 
+	fs := e.failStates[r.JobID]
+	// An old success replayed late does not recover; a future lastFailPage
+	// (clock stepped back) never blocks recovery.
+	recovered := o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && fs != nil && fs.paged &&
+		(!o.finishedAt.Before(fs.lastFailPage) || e.now().Before(fs.lastFailPage))
 	switch {
+	case e.collapsible(r, o, je):
+		e.pageFailure(r, o)
 	case o.page:
 		e.page(r, notify.Fail, o.pageTitle, o.err)
+	case recovered:
+		e.pageRecovered(r, fs) // replaces notify_on_success's "succeeded" for this run
 	case o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && je.job.Policy.NotifyOnSuccess:
 		e.page(r, notify.OK, "succeeded", "Run "+r.ID+" succeeded.")
+	}
+	// P2: a success while !paged marks held failures healed (this runs after
+	// the switch, so it never sees the batch pageRecovered just cleared).
+	if o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && !recovered {
+		if pc := e.pageBatch[r.JobID]; pc != nil && pc.failed > 0 {
+			pc.healed = true
+		}
 	}
 	if je != nil && e.d.Pusher != nil && je.job.Policy.PushURLRef != "" {
 		// The current policy, not the run's revision: the ref names an
@@ -462,7 +501,83 @@ func insertNext(ctx context.Context, q store.Querier, j *model.Job, now time.Tim
 
 // ---------------------------------------------------------------- paging
 
+// collapsible reports whether a paging outcome is an exhausted plain-status
+// failure of an active job's run, which PLR-1 collapses per job.
+func (e *Engine) collapsible(r model.Run, o outcome, je *jobEntry) bool {
+	switch o.status {
+	case model.StatusFailed, model.StatusTimeout, model.StatusInterrupted:
+	default:
+		return false
+	}
+	return o.page && o.successor == nil && o.pageTitle == string(o.status) && !perRunError(o.err) &&
+		r.AdhocSpec == nil && je != nil && je.job.State == model.JobActive
+}
+
+func (e *Engine) failStateFor(jobID string) *failState {
+	fs := e.failStates[jobID]
+	if fs == nil {
+		fs = &failState{}
+		e.failStates[jobID] = fs
+	}
+	return fs
+}
+
+// lapsed reports whether a failure-page window that began at t is over (zero
+// or a future t after a clock step back count as over).
+func lapsed(t, now time.Time) bool {
+	return t.IsZero() || now.Before(t) || now.Sub(t) >= missPageEvery
+}
+
+// pageFailure pages a job's first failure at once, with any held
+// missed/coalesced/expired counts, and counts later ones for the summary.
+func (e *Engine) pageFailure(r model.Run, o outcome) {
+	now := e.now() // the page goes out now; o.finishedAt can be old on an unflushed replay
+	fs := e.failStateFor(r.JobID)
+	if fs.paged || !lapsed(fs.lastFailPage, now) {
+		pc := e.pageCountFor(r.JobID)
+		pc.failed++
+		pc.healed = false
+		pc.lastStatus, pc.lastErr = o.status, strings.ToValidUTF8(truncate(o.err, maxSummaryErrBytes), "")
+		return
+	}
+	body := o.err
+	if pc := e.pageBatch[r.JobID]; pc != nil {
+		// Held occurrences, plus failures held across a disable/re-enable.
+		if s := pc.body(); s != "" {
+			body += "\n" + s
+		}
+		delete(e.pageBatch, r.JobID)
+	}
+	e.page(r, notify.Fail, o.pageTitle, body)
+	fs.paged, fs.lastFailPage = true, now
+	e.lastMissPage[r.JobID] = now
+}
+
+// pageRecovered sends the one recovered notice; held failures ride in its
+// body. It goes at Fail level so it routes to the failure pages' topic; its
+// tag marks it as good news. Occurrence counts and lastMissPage are left to
+// their own window; lastFailPage is unchanged (the immediate page or the
+// flush already stamped it), so a failure within 10 min is counted.
+func (e *Engine) pageRecovered(r model.Run, fs *failState) {
+	body := "Run " + r.ID + " succeeded."
+	if pc := e.pageBatch[r.JobID]; pc != nil && pc.failed > 0 {
+		pc.healed = false // this page is the recovery; no "succeeded since" suffix
+		body += " Before it, " + pc.failedSentence()
+		pc.failed, pc.lastStatus, pc.lastErr = 0, "", ""
+		if pc.empty() {
+			delete(e.pageBatch, r.JobID)
+		}
+	}
+	fs.paged = false
+	e.pageTagged(r, notify.Fail, []string{"white_check_mark"}, "recovered", body)
+}
+
 func (e *Engine) page(r model.Run, level notify.Level, title, body string) {
+	e.pageTagged(r, level, nil, title, body)
+}
+
+// pageTagged is page with explicit ntfy tags (nil: the level's default).
+func (e *Engine) pageTagged(r model.Run, level notify.Level, tags []string, title, body string) {
 	if e.d.Pager == nil {
 		return
 	}
@@ -470,7 +585,7 @@ func (e *Engine) page(r model.Run, level notify.Level, title, body string) {
 	if c, err := store.GetClient(e.life, e.st.W, r.ClientID); err == nil {
 		topic = c.NtfyTopic
 	}
-	e.d.Pager.Send(notify.Msg{Level: level, Topic: topic, Title: r.JobName + ": " + title,
+	e.d.Pager.Send(notify.Msg{Level: level, Topic: topic, Tags: tags, Title: r.JobName + ": " + title,
 		Body: fmt.Sprintf("%s\nrun %s (attempt %d, %s)", body, r.ID, r.Attempt, r.Kind)})
 }
 

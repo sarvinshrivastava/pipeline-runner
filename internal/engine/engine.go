@@ -134,11 +134,22 @@ type jobEntry struct {
 	minGap time.Duration
 }
 
-// pageCount accumulates a job's missed and coalesced occurrences between
-// pages (one page per job per missPageEvery).
+// pageCount accumulates a job's missed, coalesced and expired occurrences and
+// its collapsed failures between pages (one page per job per missPageEvery).
 type pageCount struct {
 	missed, coalesced, expired int
-	capped                     bool // expired hit maxExpiredCount: "at least"
+	capped                     bool         // expired hit maxExpiredCount: "at least"
+	failed                     int          // exhausted failures held by the PLR-1 collapse
+	healed                     bool         // a success came after the newest held failure (P2)
+	lastStatus                 model.Status // of the newest held failure
+	lastErr                    string       // of the newest held failure, ≤ maxSummaryErrBytes
+}
+
+// failState is a job's failure-page collapse state (PLR-1). Loop-owned, keyed
+// by job ID on Engine (never on jobEntry: reconcile and job reloads replace it).
+type failState struct {
+	paged        bool      // a failure page went out and no recovery since
+	lastFailPage time.Time // the last failure page, immediate or summary; zero = none
 }
 
 type unflushed struct {
@@ -196,6 +207,7 @@ type Engine struct {
 	unflushed       []*unflushed
 	pageBatch       map[string]*pageCount
 	lastMissPage    map[string]time.Time
+	failStates      map[string]*failState
 	draining        bool
 	drainBy         time.Time
 	drainDone       chan struct{}
@@ -227,6 +239,7 @@ func New(d Deps) *Engine {
 		jobs: map[string]*jobEntry{}, revs: map[revKey]model.RunSpec{}, awaiters: map[string][]chan model.Run{},
 		leaseGen: map[string]uint64{}, leaseTimers: map[string]Timer{}, cancelFns: map[string]context.CancelFunc{},
 		cancelRequested: map[string]bool{}, pageBatch: map[string]*pageCount{}, lastMissPage: map[string]time.Time{},
+		failStates: map[string]*failState{},
 	}
 	e.accepting.Store(true)
 	return e

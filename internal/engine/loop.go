@@ -375,7 +375,7 @@ func (e *Engine) dispatch(runID string, now time.Time) {
 	}
 	if err != nil {
 		e.log.Error("load run spec", "run", runID, "err", err)
-		e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusFailed, err: "run specification missing", page: true})
+		e.finalize(r, []model.Status{model.StatusPending}, outcome{status: model.StatusFailed, err: errSpecMissing, page: true})
 		return
 	}
 	var je *jobEntry
@@ -693,6 +693,7 @@ func (e *Engine) flushMissedPages(now time.Time) {
 		if je == nil {
 			delete(e.pageBatch, jobID)
 			delete(e.lastMissPage, jobID)
+			delete(e.failStates, jobID)
 			continue
 		}
 		if last, ok := e.lastMissPage[jobID]; ok && now.Sub(last) < missPageEvery {
@@ -703,15 +704,67 @@ func (e *Engine) flushMissedPages(now time.Time) {
 		}
 		delete(e.pageBatch, jobID)
 		e.lastMissPage[jobID] = now
-		title := "coalesced"
-		switch {
-		case pc.missed > 0:
-			title = "missed"
-		case pc.coalesced == 0:
-			title = "expired"
+		e.pageJob(je.job, notify.Fail, summaryTitle(pc), pc.body())
+		// A summary with failures is a failure page: it restarts the failure
+		// window. It arms recovery only when no success came after them (P2),
+		// and only an existing state (a count held across a disable never
+		// re-arms).
+		if fs := e.failStates[jobID]; fs != nil && pc.failed > 0 && je.job.State == model.JobActive {
+			fs.lastFailPage = now
+			if !pc.healed {
+				fs.paged = true
+			}
 		}
-		e.pageJob(je.job, notify.Fail, title, pc.body())
 	}
+}
+
+// summaryTitle picks a batch page's title: failed > missed > coalesced > expired.
+func summaryTitle(pc *pageCount) string {
+	switch {
+	case pc.failed > 0:
+		return "failed"
+	case pc.missed > 0:
+		return "missed"
+	case pc.coalesced > 0:
+		return "coalesced"
+	}
+	return "expired"
+}
+
+// failedSentence: "N more runs failed since the last page (last: <status>);
+// last error: <err>." Singular for 1; "(none)" for an empty error. A healed
+// batch adds that the job has succeeded since.
+func (pc *pageCount) failedSentence() string {
+	n := fmt.Sprintf("%d more runs", pc.failed)
+	if pc.failed == 1 {
+		n = "1 more run"
+	}
+	errStr := pc.lastErr
+	if errStr == "" {
+		errStr = "(none)"
+	}
+	s := fmt.Sprintf("%s failed since the last page (last: %s); last error: %s.", n, pc.lastStatus, errStr)
+	if pc.healed {
+		s += " The job has succeeded since."
+	}
+	return s
+}
+
+// empty reports whether every count is zero.
+func (pc *pageCount) empty() bool {
+	return pc.missed == 0 && pc.coalesced == 0 && pc.expired == 0 && pc.failed == 0
+}
+
+// body is failedSentence (when failed > 0) followed by occurrenceBody.
+func (pc *pageCount) body() string {
+	var s []string
+	if pc.failed > 0 {
+		s = append(s, pc.failedSentence())
+	}
+	if o := pc.occurrenceBody(); o != "" {
+		s = append(s, o)
+	}
+	return strings.Join(s, " ")
 }
 
 func (e *Engine) pageCountFor(jobID string) *pageCount {
@@ -736,7 +789,8 @@ func (e *Engine) addPageCounts(jobID string, coalesced, expired int) {
 	}
 }
 
-func (pc *pageCount) body() string {
+// occurrenceBody is the missed/coalesced/expired sentences.
+func (pc *pageCount) occurrenceBody() string {
 	var s []string
 	switch {
 	case pc.missed == 1:

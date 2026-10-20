@@ -46,3 +46,20 @@ func TestQueueFullDrops(_ *testing.T) {
 		n.Send(Msg{Title: "x"}) // never blocks
 	}
 }
+
+// A Fail message with explicit tags (PLR-1's "recovered") keeps them and
+// routes to the failure topic when no override is set.
+func TestFailWithTagsKeepsTagAndFailTopic(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+	}))
+	defer srv.Close()
+	n := New(srv.URL, "", "", "fail-topic", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	n.Send(Msg{Level: Fail, Title: "j: recovered", Tags: []string{"white_check_mark"}})
+	n.Drain(context.Background())
+	tags, _ := got["tags"].([]any)
+	if got["topic"] != "fail-topic" || got["priority"] != float64(4) || len(tags) != 1 || tags[0] != "white_check_mark" {
+		t.Fatalf("body = %v", got)
+	}
+}

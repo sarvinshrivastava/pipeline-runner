@@ -44,7 +44,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	for _, r := range running {
 		spec, err := e.spec(r)
 		if err != nil {
-			e.finalize(r, []model.Status{model.StatusRunning}, outcome{status: model.StatusInterrupted, err: "run specification missing at boot", page: true, pageTitle: "interrupted"})
+			e.finalize(r, []model.Status{model.StatusRunning}, outcome{status: model.StatusInterrupted, err: errSpecMissing + " at boot", page: true, pageTitle: "interrupted"})
 			continue
 		}
 		switch {
@@ -93,7 +93,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	for _, r := range waiting {
 		spec, err := e.spec(r)
 		if err != nil || spec.Target.HTTP == nil {
-			e.finalize(r, []model.Status{model.StatusWaiting}, outcome{status: model.StatusInterrupted, err: "run specification missing at boot", page: true, pageTitle: "interrupted"})
+			e.finalize(r, []model.Status{model.StatusWaiting}, outcome{status: model.StatusInterrupted, err: errSpecMissing + " at boot", page: true, pageTitle: "interrupted"})
 			continue
 		}
 		switch {
