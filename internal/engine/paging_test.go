@@ -478,9 +478,10 @@ func TestStaleSuccessReplayDoesNotRecover(t *testing.T) {
 		h.e.afterFinalize(r, outcome{status: model.StatusSuccess, finishedAt: now.Add(-time.Second)},
 			false, -1, []model.Status{model.StatusRunning})
 		pc := h.e.pageBatch[j.ID]
-		paged, healed = h.e.failStates[j.ID].paged, pc == nil || pc.healed
+		// A taken or emptied batch counts as healed: the replay must leave it alone.
+		paged, healed = h.e.failStates[j.ID].paged, pc == nil || pc.healed || pc.failed != 1
 	})
-	if h.pager.count("recovered") != 0 || !paged || healed { // healed: also when the batch was taken
+	if h.pager.count("recovered") != 0 || !paged || healed {
 		t.Fatalf("pages = %v, paged = %v, healed = %v", h.pager.titles(), paged, healed)
 	}
 }
