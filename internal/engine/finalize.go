@@ -299,8 +299,9 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		e.page(r, notify.OK, "succeeded", "Run "+r.ID+" succeeded.")
 	}
 	// P2: a success while !paged marks held failures healed (this runs after
-	// the switch, so it never sees the batch pageRecovered just cleared).
-	if jobSuccess && !recovered {
+	// the switch, so it never sees the batch pageRecovered just cleared). A
+	// stale replayed success while paged neither recovers nor heals.
+	if jobSuccess && !recovered && (fs == nil || !fs.paged) {
 		if pc := e.pageBatch[r.JobID]; pc != nil && pc.failed > 0 {
 			pc.healed = true
 		}

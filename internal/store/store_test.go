@@ -342,7 +342,10 @@ func TestRecentChainEnds(t *testing.T) {
 		}, []ChainEnd{{model.StatusTimeout, "slow"}}},
 		{"ad hoc run ignored", func(t *testing.T, s *Store, j model.Job) {
 			endedRun(t, s, j, model.StatusInterrupted, "restart", at(1), nil)
-			id, _ := newV7()
+			id, err := newV7()
+			if err != nil {
+				t.Fatal(err)
+			}
 			fin := at(2)
 			r := model.Run{ID: id, JobID: j.ID, JobName: j.Name, ClientID: j.ClientID, Kind: model.KindAdhoc, Attempt: 1,
 				ChainRootID: id, Status: model.StatusFailed, ScheduledFor: t0, OriginFor: t0, ContextFor: t0, LatenessRef: t0,

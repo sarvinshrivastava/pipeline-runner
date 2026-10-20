@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/notify"
@@ -469,21 +470,22 @@ func TestStaleSuccessReplayDoesNotRecover(t *testing.T) {
 	h := newHarness(t)
 	j := h.create(invokeJob("j", nil))
 	r := insertRunning(t, h, j, model.KindInvoke, t0, nil)
-	var paged bool
+	var paged, healed bool
 	h.onLoop(func() {
 		now := h.e.now()
 		h.e.failStates[j.ID] = &failState{paged: true, lastFailPage: now}
+		h.e.pageBatch[j.ID] = &pageCount{failed: 1, lastStatus: model.StatusFailed}
 		h.e.afterFinalize(r, outcome{status: model.StatusSuccess, finishedAt: now.Add(-time.Second)},
 			false, -1, []model.Status{model.StatusRunning})
-		paged = h.e.failStates[j.ID].paged
+		paged, healed = h.e.failStates[j.ID].paged, h.e.pageBatch[j.ID].healed
 	})
-	if h.pager.count("recovered") != 0 || !paged {
-		t.Fatalf("pages = %v, paged = %v", h.pager.titles(), paged)
+	if h.pager.count("recovered") != 0 || !paged || healed {
+		t.Fatalf("pages = %v, paged = %v, healed = %v", h.pager.titles(), paged, healed)
 	}
 }
 
 func TestPageCountText(t *testing.T) {
-	long := strings.Repeat("é", 400) // 800 bytes: the 512-byte cut splits a rune
+	long := "x" + strings.Repeat("é", 400) // 801 bytes: the 512-byte cut splits a rune
 	tests := []struct {
 		name  string
 		pc    pageCount
@@ -527,7 +529,7 @@ func TestPageCountText(t *testing.T) {
 	h.runOnce(j.ID, f, model.StatusFailed)
 	h.runOnce(j.ID, f, model.StatusFailed)
 	pc, _ := h.batch(j.ID)
-	if len(pc.lastErr) > maxSummaryErrBytes || len(pc.lastErr) < maxSummaryErrBytes-1 || !strings.HasPrefix(long, pc.lastErr) {
+	if len(pc.lastErr) != maxSummaryErrBytes-1 || !utf8.ValidString(pc.lastErr) || !strings.HasPrefix(long, pc.lastErr) {
 		t.Fatalf("held error is %d bytes", len(pc.lastErr))
 	}
 }
@@ -729,4 +731,89 @@ func setEnabled(t *testing.T, h *harness, jobID string, on bool) {
 		t.Fatal(err)
 	}
 	h.sync()
+}
+
+// insertSpecless inserts a running run of j whose revision has no spec row,
+// so boot finalizes it as "run specification missing at boot".
+func insertSpecless(t *testing.T, h *harness, j model.Job) model.Run {
+	t.Helper()
+	j.Rev = 999
+	return insertRunning(t, h, j, model.KindInvoke, h.clk.Now(), nil)
+}
+
+func TestBootSpecMissingPagesPerRun(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	h.stop()
+	insertSpecless(t, h, j)
+	insertSpecless(t, h, j)
+	h.start()
+	h.sync()
+	if n := h.pager.count("j: interrupted"); n != 2 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	if _, ok := h.failState(j.ID); ok {
+		t.Fatal("spec-missing pages must not create collapse state")
+	}
+}
+
+// The per-run classes whose title alone does not exclude them at boot: only
+// the stored error text is left there.
+func TestRestartPerRunClassesDoNotArm(t *testing.T) {
+	until := t0.Add(2 * time.Hour)
+	tests := []struct {
+		name string
+		job  model.JobCreate
+		end  func(h *harness, j model.Job)
+	}{
+		{"defer cap", invokeJob("j", &model.PolicyIn{MaxDeferSec: ptr(int64(3600))}), func(h *harness, j model.Job) {
+			h.runOnce(j.ID, func(context.Context, target.ExecInput) target.Result {
+				return target.Result{DeferUntil: &until, HTTPStatus: code(200)}
+			}, model.StatusFailed)
+		}},
+		{"lease expired at_least_once", asyncJob("j"), func(h *harness, j model.Job) {
+			h.exec.set(waiting)
+			r := invoke(h.t, h, j.ID)
+			h.waitStatus(r.ID, model.StatusWaiting)
+			h.advance(61 * time.Second)
+			if got := h.waitStatus(r.ID, model.StatusInterrupted); got.Error != errLeaseExpired {
+				h.t.Fatalf("error = %q", got.Error)
+			}
+		}},
+		{"spec missing at boot", invokeJob("j", nil), func(h *harness, j model.Job) {
+			h.stop()
+			r := insertSpecless(h.t, h, j)
+			h.start()
+			h.waitStatus(r.ID, model.StatusInterrupted)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			j := h.create(tc.job)
+			tc.end(h, j)
+			h.stop()
+			h.start()
+			if _, ok := h.failState(j.ID); ok {
+				t.Fatal("a per-run class must not arm recovery at boot")
+			}
+			h.runOnce(j.ID, nil, model.StatusSuccess)
+			if h.pager.count("recovered") != 0 {
+				t.Fatalf("pages = %v", h.pager.titles())
+			}
+		})
+	}
+}
+
+func TestReconcileDropsFailStateOfInactiveJob(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	h.runOnce(j.ID, boom(), model.StatusFailed)
+	if err := store.SetJobState(context.Background(), h.st.W, j.ID, model.JobDisabled, h.clk.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h.advance(reconcileEvery)
+	if _, ok := h.failState(j.ID); ok {
+		t.Fatal("reconcile must drop an inactive job's failure state")
+	}
 }
