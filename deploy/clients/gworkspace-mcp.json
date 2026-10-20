@@ -1,0 +1,6 @@
+{
+  "name": "gworkspace-mcp",
+  "scopes": ["jobs:read"],
+  "callback_hosts": ["gworkspace-mcp"],
+  "secret_ref_prefixes": ["Root/GWORKSPACE_PLR_TOKEN", "Root/KUMA_PUSH_GWORKSPACE_HOUSEKEEPING"]
+}

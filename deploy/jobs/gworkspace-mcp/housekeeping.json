@@ -1,0 +1,12 @@
+{
+  "client": "gworkspace-mcp",
+  "name": "housekeeping",
+  "trigger": {"type": "cron", "cron": "0 6 * * *", "timezone": "Asia/Kolkata"},
+  "target": {"type": "http", "http": {
+    "method": "POST", "url": "http://gworkspace-mcp:3014/internal/housekeeping", "mode": "sync",
+    "auth": {"bearer_ref": "Root/GWORKSPACE_PLR_TOKEN"}}},
+  "policy": {"timeout_sec": 120, "max_late_sec": 21600, "late_warn_sec": 300, "overlap": "skip",
+    "delivery": "at_least_once", "retry": {"max_attempts": 3, "backoff_sec": 300, "max_backoff_sec": 1800},
+    "priority": "low", "concurrency_key": "gworkspace-mcp", "concurrency_limit": 1,
+    "push_url_ref": "Root/KUMA_PUSH_GWORKSPACE_HOUSEKEEPING"}
+}

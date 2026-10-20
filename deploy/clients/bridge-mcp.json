@@ -1,0 +1,6 @@
+{
+  "name": "bridge-mcp",
+  "scopes": ["jobs:read"],
+  "callback_hosts": ["bridge-mcp"],
+  "secret_ref_prefixes": ["Root/BRIDGE_MCP_PLR_TOKEN", "Root/KUMA_PUSH_BRIDGE_DAILY_HEALTH"]
+}
