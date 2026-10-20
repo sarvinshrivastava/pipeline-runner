@@ -831,3 +831,90 @@ func TestReconcileDropsFailStateOfInactiveJob(t *testing.T) {
 		t.Fatal("reconcile must drop an inactive job's failure state")
 	}
 }
+
+// Runtime "run specification missing" pages carry no title and stay per run.
+func TestRuntimeSpecMissingPagesPerRun(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	var ids []string
+	for range 2 {
+		id := newID()
+		now := h.clk.Now()
+		r := model.Run{ID: id, JobID: j.ID, JobName: j.Name, ClientID: j.ClientID, Kind: model.KindInvoke, Attempt: 1,
+			ChainRootID: id, Status: model.StatusPending, ScheduledFor: now, OriginFor: now, ContextFor: now,
+			LatenessRef: now, Rev: 999, CreatedAt: now}
+		if err := store.InsertRun(context.Background(), h.st.W, r); err != nil {
+			t.Fatal(err)
+		}
+		h.onLoop(func() { h.e.pushRun(r) })
+		ids = append(ids, id)
+	}
+	for _, id := range ids {
+		if got := h.waitStatus(id, model.StatusFailed); got.Error != errSpecMissing {
+			t.Fatalf("error = %q", got.Error)
+		}
+	}
+	if n := len(h.pager.bodies("j: ")); n != 2 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	if _, ok := h.failState(j.ID); ok {
+		t.Fatal("spec-missing pages must not create collapse state")
+	}
+}
+
+// EC9: a failure finalized after its job left the cache (an unflushed replay
+// after a delete) pages per run and creates no state.
+func TestFailureOfUncachedJobPagesPerRun(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	r := insertRunning(t, h, j, model.KindInvoke, t0, nil)
+	var created bool
+	h.onLoop(func() {
+		delete(h.e.jobs, j.ID)
+		for range 2 {
+			h.e.afterFinalize(r, outcome{status: model.StatusFailed, err: "boom", page: true, pageTitle: "failed", finishedAt: h.e.now()},
+				false, -1, []model.Status{model.StatusRunning})
+		}
+		_, created = h.e.failStates[j.ID]
+	})
+	if h.pager.count("j: failed") != 2 || created {
+		t.Fatalf("pages = %v, state created = %v", h.pager.titles(), created)
+	}
+}
+
+// EC14: a missed-only flush never arms recovery.
+func TestMissedOnlyFlushDoesNotArm(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	h.runOnce(j.ID, boom(), model.StatusFailed)
+	h.runOnce(j.ID, nil, model.StatusSuccess) // recovered: paged false, state kept
+	h.onLoop(func() { h.e.pageCountFor(j.ID).missed++ })
+	h.advance(missPageEvery + time.Second)
+	if h.pager.count("j: missed") != 1 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	h.runOnce(j.ID, nil, model.StatusSuccess)
+	if n := h.pager.count("j: recovered"); n != 1 {
+		t.Fatalf("recovered = %d: %v", n, h.pager.titles())
+	}
+}
+
+// Timeouts collapse like failures; the summary names the last status.
+func TestTimeoutFailuresCollapse(t *testing.T) {
+	h := newHarness(t)
+	j := h.create(invokeJob("j", nil))
+	slow := func(context.Context, target.ExecInput) target.Result {
+		return target.Result{Status: model.StatusTimeout, Error: "slow", NoRetry: true}
+	}
+	for range 3 {
+		h.runOnce(j.ID, slow, model.StatusTimeout)
+	}
+	h.advance(missPageEvery + time.Second)
+	if h.pager.count("j: timeout") != 1 {
+		t.Fatalf("pages = %v", h.pager.titles())
+	}
+	b := h.pager.bodies("j: failed")
+	if len(b) != 1 || !strings.Contains(b[0], "2 more runs failed since the last page (last: timeout); last error: slow.") {
+		t.Fatalf("summary = %q", b)
+	}
+}
