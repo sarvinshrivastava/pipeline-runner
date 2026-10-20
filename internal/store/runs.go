@@ -277,6 +277,37 @@ func SuccessorOf(ctx context.Context, q Querier, r model.Run) (string, error) {
 	return id, err
 }
 
+// recentChainEndsSQL is pinned to runs_by_job like CountInFlightOnDemand; the
+// successor check uses runs_chain (TestRecentChainEndsQueryPlan).
+const recentChainEndsSQL = `SELECT status, COALESCE(error, '') FROM (
+	SELECT r.id, r.status, r.error, r.finished_at FROM runs r INDEXED BY runs_by_job
+	WHERE r.job_id = ? AND r.adhoc_spec_json IS NULL
+		AND r.status IN ('success', 'failed', 'timeout', 'interrupted')
+		AND NOT EXISTS (SELECT 1 FROM runs c WHERE c.chain_root_id = r.chain_root_id AND c.parent_run_id = r.id)
+	ORDER BY r.id DESC LIMIT 64
+) ORDER BY finished_at DESC, id DESC`
+
+// ChainEnd is a job run that ended its chain.
+type ChainEnd struct {
+	Status model.Status
+	Error  string
+}
+
+// RecentChainEnds returns up to 64 of the job's newest chain-ending runs
+// (success, failed, timeout or interrupted, no successor row of any status,
+// not ad hoc), newest finished first. The 64 are the newest by id (UUIDv7,
+// creation order, index runs_by_job); re-sorting them by finished_at puts
+// overlapping runs that finished out of creation order right.
+func RecentChainEnds(ctx context.Context, q Querier, jobID string) ([]ChainEnd, error) {
+	return queryAll(ctx, q, func(row scanner) (ChainEnd, error) {
+		var c ChainEnd
+		var status string
+		err := row.Scan(&status, &c.Error)
+		c.Status = model.Status(status)
+		return c, err
+	}, recentChainEndsSQL, jobID)
+}
+
 // CountInFlightOnDemand counts a client's runs in flight (pending, running or
 // waiting) other than schedule runs: invokes, ad hoc runs and their retries
 // and defers. Schedule runs are bounded by the job limit.

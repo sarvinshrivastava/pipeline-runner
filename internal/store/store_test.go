@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -285,5 +286,118 @@ func TestRunStatusAndSuccessorOf(t *testing.T) {
 	}
 	if next, err := SuccessorOf(bg, s.R, root); err != nil || next != retry.ID {
 		t.Fatalf("successor %q %v, want %s", next, err, retry.ID)
+	}
+}
+
+// endedRun inserts a finished invoke run of j (its own chain root unless
+// parent is set) and returns it. IDs are UUIDv7, so creation order is id order.
+func endedRun(t *testing.T, s *Store, j model.Job, status model.Status, errStr string, finished time.Time, parent *model.Run) model.Run {
+	t.Helper()
+	id, err := newV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := model.Run{ID: id, JobID: j.ID, JobName: j.Name, ClientID: j.ClientID, Kind: model.KindInvoke, Attempt: 1,
+		ChainRootID: id, Status: status, ScheduledFor: t0, OriginFor: t0, ContextFor: t0, LatenessRef: t0, Rev: 1,
+		Error: errStr, CreatedAt: t0}
+	if parent != nil {
+		r.Kind, r.Attempt, r.ParentRunID, r.ChainRootID = model.KindRetry, parent.Attempt+1, parent.ID, parent.ChainRootID
+	}
+	if status.Terminal() {
+		r.FinishedAt = &finished
+	}
+	if err := InsertRun(bg, s.W, r); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func TestRecentChainEnds(t *testing.T) {
+	at := func(sec int) time.Time { return t0.Add(time.Duration(sec) * time.Second) }
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, s *Store, j model.Job)
+		want  []ChainEnd
+	}{
+		{"no runs", func(*testing.T, *Store, model.Job) {}, nil},
+		{"success then failed", func(t *testing.T, s *Store, j model.Job) {
+			endedRun(t, s, j, model.StatusSuccess, "", at(1), nil)
+			endedRun(t, s, j, model.StatusFailed, "boom", at(2), nil)
+		}, []ChainEnd{{model.StatusFailed, "boom"}, {model.StatusSuccess, ""}}},
+		{"newest failed has a pending retry", func(t *testing.T, s *Store, j model.Job) {
+			endedRun(t, s, j, model.StatusSuccess, "", at(1), nil)
+			f := endedRun(t, s, j, model.StatusFailed, "boom", at(2), nil)
+			endedRun(t, s, j, model.StatusPending, "", at(3), &f)
+		}, []ChainEnd{{model.StatusSuccess, ""}}},
+		{"newest failed has a cancelled retry", func(t *testing.T, s *Store, j model.Job) {
+			endedRun(t, s, j, model.StatusSuccess, "", at(1), nil)
+			f := endedRun(t, s, j, model.StatusFailed, "boom", at(2), nil)
+			endedRun(t, s, j, model.StatusCancelled, "job disabled", at(3), &f)
+		}, []ChainEnd{{model.StatusSuccess, ""}}},
+		{"cancelled, skipped and missed ignored", func(t *testing.T, s *Store, j model.Job) {
+			endedRun(t, s, j, model.StatusTimeout, "slow", at(1), nil)
+			endedRun(t, s, j, model.StatusCancelled, "", at(2), nil)
+			endedRun(t, s, j, model.StatusSkipped, "", at(3), nil)
+			endedRun(t, s, j, model.StatusMissed, "", at(4), nil)
+		}, []ChainEnd{{model.StatusTimeout, "slow"}}},
+		{"ad hoc run ignored", func(t *testing.T, s *Store, j model.Job) {
+			endedRun(t, s, j, model.StatusInterrupted, "restart", at(1), nil)
+			id, _ := newV7()
+			fin := at(2)
+			r := model.Run{ID: id, JobID: j.ID, JobName: j.Name, ClientID: j.ClientID, Kind: model.KindAdhoc, Attempt: 1,
+				ChainRootID: id, Status: model.StatusFailed, ScheduledFor: t0, OriginFor: t0, ContextFor: t0, LatenessRef: t0,
+				AdhocSpec: &spec, FinishedAt: &fin, Error: "adhoc", CreatedAt: t0}
+			if err := InsertRun(bg, s.W, r); err != nil {
+				t.Fatal(err)
+			}
+		}, []ChainEnd{{model.StatusInterrupted, "restart"}}},
+		{"NULL error reads empty", func(t *testing.T, s *Store, j model.Job) {
+			endedRun(t, s, j, model.StatusFailed, "", at(1), nil) // nullStr("") stores NULL
+		}, []ChainEnd{{model.StatusFailed, ""}}},
+		{"older id finished later sorts first", func(t *testing.T, s *Store, j model.Job) {
+			endedRun(t, s, j, model.StatusFailed, "older id", at(5), nil)
+			endedRun(t, s, j, model.StatusSuccess, "", at(4), nil)
+		}, []ChainEnd{{model.StatusFailed, "older id"}, {model.StatusSuccess, ""}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := open(t)
+			_, j := seed(t, s)
+			tc.setup(t, s, j)
+			got, err := RecentChainEnds(bg, s.R, j.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecentChainEndsQueryPlan(t *testing.T) {
+	s := open(t)
+	_, j := seed(t, s)
+	rows, err := s.W.QueryContext(bg, "EXPLAIN QUERY PLAN "+recentChainEndsSQL, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, idx := range []string{"runs_by_job", "runs_chain"} {
+		if !strings.Contains(plan, idx) {
+			t.Fatalf("plan does not use %s:\n%s", idx, plan)
+		}
 	}
 }
