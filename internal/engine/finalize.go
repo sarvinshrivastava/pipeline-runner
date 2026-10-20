@@ -31,10 +31,12 @@ const (
 	errDeferCap        = "target asked to defer to "                      // decide, prefix
 )
 
+var perRunErrorPrefixes = [...]string{errSpecMissing, errNeedsHuman, errLeaseExpired, errDeferCap}
+
 // perRunError reports whether a failure's error marks a class that pages per
 // run (never collapsed, never arms recovery).
 func perRunError(err string) bool {
-	for _, p := range []string{errSpecMissing, errNeedsHuman, errLeaseExpired, errDeferCap} {
+	for _, p := range perRunErrorPrefixes {
 		if strings.HasPrefix(err, p) {
 			return true
 		}
@@ -280,11 +282,12 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		}
 	}
 
+	jobSuccess := o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil
 	fs := e.failStates[r.JobID]
 	// An old success replayed late does not recover; a future lastFailPage
 	// (clock stepped back) never blocks recovery.
-	recovered := o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && fs != nil && fs.paged &&
-		(!o.finishedAt.Before(fs.lastFailPage) || e.now().Before(fs.lastFailPage))
+	recovered := jobSuccess && fs != nil && fs.paged &&
+		(!finished.Before(fs.lastFailPage) || e.now().Before(fs.lastFailPage))
 	switch {
 	case e.collapsible(r, o, je):
 		e.pageFailure(r, o)
@@ -292,12 +295,12 @@ func (e *Engine) afterFinalize(r model.Run, o outcome, jobDone bool, skips int, 
 		e.page(r, notify.Fail, o.pageTitle, o.err)
 	case recovered:
 		e.pageRecovered(r, fs) // replaces notify_on_success's "succeeded" for this run
-	case o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && je.job.Policy.NotifyOnSuccess:
+	case jobSuccess && je.job.Policy.NotifyOnSuccess:
 		e.page(r, notify.OK, "succeeded", "Run "+r.ID+" succeeded.")
 	}
 	// P2: a success while !paged marks held failures healed (this runs after
 	// the switch, so it never sees the batch pageRecovered just cleared).
-	if o.status == model.StatusSuccess && r.AdhocSpec == nil && je != nil && !recovered {
+	if jobSuccess && !recovered {
 		if pc := e.pageBatch[r.JobID]; pc != nil && pc.failed > 0 {
 			pc.healed = true
 		}
