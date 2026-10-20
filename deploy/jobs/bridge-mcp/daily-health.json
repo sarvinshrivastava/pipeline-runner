@@ -1,0 +1,12 @@
+{
+  "client": "bridge-mcp",
+  "name": "daily-health",
+  "trigger": {"type": "cron", "cron": "30 7 * * *", "timezone": "Asia/Kolkata"},
+  "target": {"type": "http", "http": {
+    "method": "POST", "url": "http://bridge-mcp:3012/internal/checks/daily-health", "mode": "sync",
+    "auth": {"bearer_ref": "Root/BRIDGE_MCP_PLR_TOKEN"}}},
+  "policy": {"timeout_sec": 60, "max_late_sec": 3600, "late_warn_sec": 120, "overlap": "skip",
+    "delivery": "at_least_once", "retry": {"max_attempts": 2, "backoff_sec": 120, "max_backoff_sec": 600},
+    "priority": "normal", "notify_on_success": false,
+    "push_url_ref": "Root/KUMA_PUSH_BRIDGE_DAILY_HEALTH"}
+}
