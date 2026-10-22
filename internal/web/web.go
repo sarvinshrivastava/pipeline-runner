@@ -37,8 +37,9 @@ func Files() fs.FS {
 // local .git/info/exclude has an unanchored `docs/` that would silently drop it
 // from git. /apidocs/* has no route.
 func Handler() http.Handler {
-	fsrv := http.FileServerFS(Files())
-	sub, err := fs.Sub(Files(), "apidocs")
+	files := Files()
+	fsrv := http.FileServerFS(files)
+	sub, err := fs.Sub(files, "apidocs")
 	if err != nil {
 		panic(err) // embedded at build time; cannot fail at runtime
 	}

@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -152,12 +153,7 @@ func setOf[K comparable](keys ...K) map[K]bool {
 }
 
 func keysOf[V any](m map[string]V) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(m))
 }
 
 // diff returns the sorted keys of a that are not in b.
@@ -790,21 +786,14 @@ func schemaNode(t *testing.T, doc map[string]any, name string, path ...string) m
 		node = next
 	}
 	if all, ok := node["allOf"].([]any); ok {
-		merged := map[string]any{}
-		for k, v := range node {
-			merged[k] = v
-		}
+		merged := maps.Clone(node)
 		props := map[string]any{}
 		for _, part := range all {
 			pm, _ := resolve(t, doc, part)["properties"].(map[string]any)
-			for k, v := range pm {
-				props[k] = v
-			}
+			maps.Copy(props, pm)
 		}
 		if own, ok := node["properties"].(map[string]any); ok {
-			for k, v := range own {
-				props[k] = v
-			}
+			maps.Copy(props, own)
 		}
 		merged["properties"] = props
 		node = merged
@@ -1014,7 +1003,7 @@ func TestOpenAPIEnumsMatchCode(t *testing.T) {
 	for _, p := range enumPairs {
 		var keys []string
 		for k := range sets {
-			if k == p.constKey || strings.HasPrefix(k, p.constKey) {
+			if strings.HasPrefix(k, p.constKey) {
 				keys = append(keys, k)
 			}
 		}
