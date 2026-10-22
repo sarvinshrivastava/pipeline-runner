@@ -26,7 +26,8 @@ window.ui = SwaggerUIBundle({
   queryConfigEnabled: false,
   validatorUrl: null,
   // Try it out only for reads. Enabling writes means widening this list AND
-  // adding an Idempotency-Key guard (see the plan's Open question 2).
+  // adding a requestInterceptor guard that fills a blank Idempotency-Key and
+  // reuses it on a double Execute, or a double click creates two jobs.
   supportedSubmitMethods: ["get", "head"],
   requestInterceptor: guardRequest,
   // guardRequest throws before anything is sent. Swagger UI then has no

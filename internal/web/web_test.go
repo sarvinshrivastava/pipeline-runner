@@ -33,13 +33,19 @@ func TestStaticNoInline(t *testing.T) {
 		}
 	}
 	for _, script := range []string{"app.js", "apidocs/init.js"} {
-		js, _ := fs.ReadFile(Files(), script)
+		js, err := fs.ReadFile(Files(), script)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if strings.Contains(string(js), "innerHTML") || strings.Contains(string(js), "insertAdjacentHTML") {
 			t.Errorf("%s must use textContent, not HTML injection", script)
 		}
 	}
 	// The docs link opens a new context without the dashboard's sessionStorage.
-	html, _ := fs.ReadFile(Files(), "index.html")
+	html, err := fs.ReadFile(Files(), "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
 	link := regexp.MustCompile(`<a [^>]*href="/docs/"[^>]*>`).Find(html)
 	if link == nil || !strings.Contains(string(link), `target="_blank"`) || !strings.Contains(string(link), `rel="noopener noreferrer"`) {
 		t.Errorf("dashboard docs link must carry target=_blank and rel=\"noopener noreferrer\": %s", link)
@@ -141,6 +147,7 @@ func TestDocsVendorPinned(t *testing.T) {
 	}
 	read("LICENSE")
 	read("NOTICE")
+	read("swagger-ui-bundle.js.LICENSE.txt")
 
 	// DOMPurify's known advisories need IN_PLACE: an upgrade that starts using
 	// it, or sanitizes in new places, gets a human look first.
@@ -150,7 +157,7 @@ func TestDocsVendorPinned(t *testing.T) {
 	if n := strings.Count(string(bundle), ".sanitize("); n != pin.sanitizeCalls {
 		t.Errorf("bundle has %d .sanitize( calls, pinned %d", n, pin.sanitizeCalls)
 	}
-	if regexp.MustCompile(`IN_PLACE\s*:\s*(!0|true|[A-Za-z_$])`).Match(bundle) {
+	if regexp.MustCompile(`["']?IN_PLACE["']?\s*:\s*(!0|true|1|[A-Za-z_$])`).Match(bundle) {
 		t.Error("bundle sets DOMPurify IN_PLACE: check the DOMPurify advisories before vendoring")
 	}
 
@@ -168,12 +175,14 @@ func TestDocsVendorPinned(t *testing.T) {
 		}
 	}
 
-	_ = fs.WalkDir(Files(), "apidocs", func(p string, _ fs.DirEntry, err error) error {
+	if err := fs.WalkDir(Files(), "apidocs", func(p string, _ fs.DirEntry, err error) error {
 		if err == nil && strings.HasSuffix(p, ".map") {
 			t.Errorf("source map %s is vendored", p)
 		}
 		return err
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fs.Stat(Files(), "docs"); err == nil {
 		t.Error("static/docs exists: .git/info/exclude ignores docs/, so it would never be committed")
 	}

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
@@ -57,6 +58,9 @@ func resolve(t *testing.T, doc map[string]any, node any) map[string]any {
 		if m, _ = cur.(map[string]any); m == nil {
 			t.Fatalf("unresolvable $ref %s", ref)
 		}
+	}
+	if _, unresolved := m["$ref"]; unresolved {
+		t.Fatalf("$ref chain too deep or cyclic: %v", m["$ref"])
 	}
 	return m
 }
@@ -434,7 +438,11 @@ func TestOpenAPIExamplesAccepted(t *testing.T) {
 	// Order B: the push field, then a policy that omits it (kept).
 	second := minimalJob(t, doc)
 	second["name"] = "publish-tick-2"
-	job2 := e.do("POST", "/v1/jobs", adminToken, second).json(t)["id"].(string)
+	r2 := e.do("POST", "/v1/jobs", adminToken, second)
+	if r2.status != 201 {
+		t.Fatalf("second job: %d %s", r2.status, r2.body)
+	}
+	job2 := r2.json(t)["id"].(string)
 	send("patchJob", "withKumaPush", "/v1/jobs/"+job2, adminToken, 200)
 	send("patchJob", "lateAndSkip", "/v1/jobs/"+job2, adminToken, 200)
 	if got := pushRef(job2); got != "ReelDrop/KUMA_PUSH" {
@@ -490,7 +498,7 @@ func TestErrorCodesDocumented(t *testing.T) {
 		codes[e.code] = true
 	}
 	res := []*regexp.Regexp{
-		regexp.MustCompile(`writeError\(w, http\.Status\w+, "([a-z_]+)"`),
+		regexp.MustCompile(`writeError\(\s*w,\s*http\.Status\w+,\s*"([a-z_]+)"`),
 		regexp.MustCompile(`FieldError\{[^}]*Code: "([a-z_]+)"`),
 		regexp.MustCompile(`fieldErr\([^,]+, "([a-z_]+)"`),
 		regexp.MustCompile(`Code\w+\s*=\s*"([a-z_]+)"`),
@@ -539,6 +547,11 @@ func checkKeys(t *testing.T, doc map[string]any, where string, schema map[string
 	case map[string]any:
 		props, ok := schema["properties"].(map[string]any)
 		if !ok {
+			for _, k := range []string{"allOf", "oneOf", "anyOf"} {
+				if schema[k] != nil {
+					t.Fatalf("%s: a %s schema cannot be compared key by key; give it properties", where, k)
+				}
+			}
 			return // an untyped object (target, payload): nothing to compare
 		}
 		for k, v := range b {
@@ -844,7 +857,7 @@ var schemaDTOExempt = map[string]string{
 	"Report":           "top level is a map in validateNewJob/validateJob; checks.items is paired with engine.Check",
 }
 
-// schemaPropsExempt names schema keys (by "Schema.key") that deliberately
+// schemaPropsExempt names schema keys (by "<label>.key", the label as in schemaDTOs) that deliberately
 // differ from the Go side. Empty today.
 var schemaPropsExempt = map[string]string{}
 
@@ -859,11 +872,22 @@ var unpairedNested = map[string]string{
 	"Target.inline":    "ContainerIn / InlineIn (validate.go) are not enabled in prod; Delivery 1b (2026-10-18) dropped them",
 }
 
-var marshalerType = reflect.TypeFor[json.Marshaler]()
+var (
+	marshalerType     = reflect.TypeFor[json.Marshaler]()
+	textMarshalerType = reflect.TypeFor[encoding.TextMarshaler]()
+)
+
+// splitExempt splits an exemption key "<label>.<json key>" at its last dot.
+func splitExempt(k string) (label, key string) {
+	i := strings.LastIndex(k, ".")
+	return k[:i], k[i+1:]
+}
 
 func TestOpenAPISchemaPropertiesMatchDTOs(t *testing.T) {
 	doc := loadDoc(t)
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
 	covered := map[string]bool{}
+	seenPropsExempt, seenIOExempt := map[string]bool{}, map[string]bool{}
 	for _, p := range schemaDTOs {
 		covered[p.schema] = true
 		label := p.schema
@@ -873,23 +897,24 @@ func TestOpenAPISchemaPropertiesMatchDTOs(t *testing.T) {
 		props := schemaProps(t, doc, p.schema, p.path...)
 		union := map[string]bool{}
 		for _, typ := range p.types {
-			if typ.Implements(marshalerType) || reflect.PointerTo(typ).Implements(marshalerType) {
-				t.Errorf("%s: %s implements json.Marshaler; compare marshalled keys instead", label, typ)
+			for _, m := range []reflect.Type{marshalerType, textMarshalerType} {
+				if typ.Implements(m) || reflect.PointerTo(typ).Implements(m) {
+					t.Errorf("%s: %s implements %s; compare marshalled keys instead", label, typ, m)
+				}
 			}
 			for k := range jsonTags(typ) {
 				union[k] = true
 			}
 		}
 		for k, reason := range schemaPropsExempt {
-			name, key, _ := strings.Cut(k, ".")
-			if name != p.schema || len(p.path) > 0 {
-				continue
+			if owner, key := splitExempt(k); owner == label {
+				seenPropsExempt[k] = true
+				if props[key] == union[key] {
+					t.Errorf("schemaPropsExempt %s (%s) no longer differs: remove the stale exemption", k, reason)
+				}
+				delete(props, key)
+				delete(union, key)
 			}
-			if props[key] == union[key] {
-				t.Errorf("schemaPropsExempt %s (%s) no longer differs: remove the stale exemption", k, reason)
-			}
-			delete(props, key)
-			delete(union, key)
 		}
 		if missing, extra := diff(union, props), diff(props, union); len(missing) > 0 || len(extra) > 0 {
 			t.Errorf("%s: missing in schema: %v; no Go field: %v", label, missing, extra)
@@ -897,24 +922,39 @@ func TestOpenAPISchemaPropertiesMatchDTOs(t *testing.T) {
 		if len(p.types) == 2 {
 			out, in := jsonTags(p.types[0]), jsonTags(p.types[1])
 			for _, k := range append(diff(out, in), diff(in, out)...) {
-				if ioAsymmetric[p.schema+"."+k] == "" {
+				if ioAsymmetric[label+"."+k] == "" {
 					t.Errorf("%s: %q is on only one of %s / %s; add it to the other or to ioAsymmetric", label, k, p.types[0], p.types[1])
 				}
 			}
 			for k, reason := range ioAsymmetric {
-				name, key, _ := strings.Cut(k, ".")
-				if name == p.schema && len(p.path) == 0 && out[key] == in[key] {
-					t.Errorf("ioAsymmetric %s (%s) no longer differs: remove the stale exemption", k, reason)
+				if owner, key := splitExempt(k); owner == label {
+					seenIOExempt[k] = true
+					if out[key] == in[key] {
+						t.Errorf("ioAsymmetric %s (%s) no longer differs: remove the stale exemption", k, reason)
+					}
 				}
 			}
 		}
 	}
-	for name := range doc["components"].(map[string]any)["schemas"].(map[string]any) {
+	for k := range schemaPropsExempt {
+		if !seenPropsExempt[k] {
+			t.Errorf("schemaPropsExempt %s matches no pair in schemaDTOs: remove it", k)
+		}
+	}
+	for k := range ioAsymmetric {
+		if !seenIOExempt[k] {
+			t.Errorf("ioAsymmetric %s matches no two-type pair in schemaDTOs: remove it", k)
+		}
+	}
+	for name := range schemas {
 		if !covered[name] && schemaDTOExempt[name] == "" {
 			t.Errorf("schema %s is neither paired in schemaDTOs nor listed in schemaDTOExempt", name)
 		}
 	}
 	for k := range schemaDTOExempt {
+		if _, ok := schemas[k]; !ok {
+			t.Errorf("schemaDTOExempt %s names no schema: remove the stale exemption", k)
+		}
 		if covered[k] && k != "Report" {
 			t.Errorf("schemaDTOExempt %s is also paired: remove the exemption", k)
 		}
@@ -982,6 +1022,8 @@ var enumPairs = []struct {
 	{"Policy", []string{"properties", "overlap"}, "Overlap policies."},
 	{"Policy", []string{"properties", "priority"}, "Priorities"},
 	{"Policy", []string{"properties", "delivery"}, "Delivery modes."},
+	{"Trigger", []string{"properties", "type"}, "Trigger types."},
+	{"Target", []string{"properties", "type"}, "Target types."},
 }
 
 func enumOf(t *testing.T, doc map[string]any, name string, path ...string) map[string]bool {

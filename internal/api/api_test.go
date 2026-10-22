@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -116,11 +118,18 @@ func newEnvWithServer(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps
 		hs.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// When a test already began Stop (maybe in a goroutine), this Stop still
+		// waits for it to finish before the store closes. Its own shutdown event
+		// may find no loop to answer it, so that part gets a short deadline.
+		stopCtx := ctx
 		select {
-		case <-e.Stopping(): // a test already stopped it; a second Stop can stall
+		case <-e.Stopping():
+			var stopCancel context.CancelFunc
+			stopCtx, stopCancel = context.WithTimeout(ctx, 200*time.Millisecond)
+			defer stopCancel()
 		default:
-			e.Stop(ctx, time.Now())
 		}
+		e.Stop(stopCtx, time.Now())
 		_ = st.Close()
 	})
 	return &env{t: t, url: hs.URL, exec: ex, st: st, srv: s, eng: e}
@@ -228,9 +237,11 @@ func TestOpenAPIParity(t *testing.T) {
 	for k, v := range inCode {
 		if d, ok := inDoc[k]; !ok {
 			t.Errorf("route %s missing from openapi.yaml", k)
+			continue
 		} else if d != v {
 			t.Errorf("%s: codes in code %s, in openapi.yaml %s", k, v, d)
-		} else if secDoc[k] != secCode[k] {
+		}
+		if secDoc[k] != secCode[k] {
 			t.Errorf("%s: security in code %s, in openapi.yaml %s", k, secCode[k], secDoc[k])
 		}
 	}
@@ -571,14 +582,20 @@ func TestDocsRoutes(t *testing.T) {
 	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	raw := func(path string) resp {
 		t.Helper()
-		req, _ := http.NewRequestWithContext(context.Background(), "GET", e.url, nil)
+		req, err := http.NewRequestWithContext(context.Background(), "GET", e.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		req.URL.Opaque = path // sent as written: no client-side cleaning
 		r, err := noFollow.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = r.Body.Close() }()
-		b, _ := io.ReadAll(r.Body)
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
 		return resp{status: r.StatusCode, body: b, header: r.Header}
 	}
 	csp := func(r resp) string { return r.header.Get("Content-Security-Policy") }
@@ -596,6 +613,20 @@ func TestDocsRoutes(t *testing.T) {
 	}
 	if r := raw("/docs/swagger-ui-bundle.js"); r.status != 200 || r.header.Get("Cache-Control") != "no-cache" {
 		t.Errorf("bundle without ?v=: %d cache=%q", r.status, r.header.Get("Cache-Control"))
+	}
+	// Every asset the docs page references is routed through the server.
+	page, err := fs.ReadFile(web.Files(), "apidocs/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assets := regexp.MustCompile(`(?:src|href)="(/docs/[^"]+)"`).FindAllSubmatch(page, -1)
+	if len(assets) != 3 {
+		t.Fatalf("apidocs/index.html references %d /docs/ assets, want 3", len(assets))
+	}
+	for _, m := range assets {
+		if r := raw(string(m[1])); r.status != 200 || csp(r) != cspDocs || r.header.Get("Content-Type") == "" {
+			t.Errorf("%s: %d csp=%q type=%q", m[1], r.status, csp(r), r.header.Get("Content-Type"))
+		}
 	}
 	if r := raw("/docs/nope"); r.status != 404 || r.code() != "not_found" || csp(r) != cspDocs {
 		t.Errorf("/docs/nope: %d %s csp=%q", r.status, r.body, csp(r))

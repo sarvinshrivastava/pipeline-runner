@@ -11,7 +11,7 @@ info:
     - Times are RFC 3339; responses use UTC.
     - Every error is `{"error":{"code","message","field?","status?"}}`. Branch on `error.code`, not on the message.
     - 401: fix the token. 403: missing scope or a forbidden value. 404: missing, or owned by another client.
-    - 409: read `error.code`. 413: body over 512 KiB (a payload over 256 KiB).
+    - 409: read `error.code`. 413: body over 512 KiB, a payload over 256 KiB, or a completion output over 64 KiB.
     - 429 `rate_limited`: stop for 5 minutes. 429 `pending_limit` or `too_many_streams`: wait for runs or streams to finish.
     - 503: retry with backoff.
     - Only `createJob`, `invokeJob` and `createAdhocRun` accept `Idempotency-Key`; other writes ignore it.
@@ -114,7 +114,7 @@ components:
     idempotencyKey:
       name: Idempotency-Key
       in: header
-      description: Same key + same body replays the response stored when the write committed (for invoke and ad-hoc runs, the 202 with the run as accepted; ?wait is not replayed). A different body is 409. Kept 24 h.
+      description: Honoured by createJob, invokeJob and createAdhocRun only; see Idempotency in the API description. Same key + same body replays the stored response; a different body is 409. Kept 24 h.
       schema: {type: string, maxLength: 128}
     cursor:
       name: cursor
@@ -123,7 +123,7 @@ components:
     limit:
       name: limit
       in: query
-      schema: {type: integer, minimum: 1, maximum: 100}
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
   responses:
     BadRequest:
       description: "Invalid input: invalid, invalid_json, invalid_wait, required, at_in_past, cron_never_fires, header_reserved, host_not_allowed, overlap_not_allowed, too_frequent, target_not_enabled, secret_ref_missing or secret_ref_not_permitted. Fix the request; error.field names the input."
