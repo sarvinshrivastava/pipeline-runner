@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/sarvinshrivastava/pipeline-runner/internal/engine"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/secure"
@@ -117,7 +115,11 @@ func newEnvWithServer(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps
 		hs.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		e.Stop(ctx, time.Now())
+		select {
+		case <-e.Stopping(): // a test already stopped it; a second Stop can stall
+		default:
+			e.Stop(ctx, time.Now())
+		}
 		_ = st.Close()
 	})
 	return &env{t: t, url: hs.URL, exec: ex, st: st, srv: s, eng: e}
@@ -195,32 +197,21 @@ var all = []string{"jobs:read", "jobs:write", "runs:invoke", "runs:adhoc"}
 // ---------------------------------------------------------------- tests
 
 func TestOpenAPIParity(t *testing.T) {
-	var doc struct {
-		Paths map[string]map[string]any `yaml:"paths"`
-	}
-	if err := yaml.Unmarshal(openapiYAML, &doc); err != nil {
-		t.Fatal(err)
-	}
-	inDoc := map[string]string{}
-	for path, ops := range doc.Paths {
-		for method, op := range ops {
-			if method == "parameters" {
-				continue
+	doc := loadDoc(t)
+	inDoc, secDoc := map[string]string{}, map[string]string{}
+	for _, o := range ops(t, doc) {
+		var codes []string
+		if rs, ok := o.op["responses"].(map[string]any); ok {
+			for c := range rs {
+				codes = append(codes, c)
 			}
-			var codes []string
-			if m, ok := op.(map[string]any); ok {
-				if rs, ok := m["responses"].(map[string]any); ok {
-					for c := range rs {
-						codes = append(codes, c)
-					}
-				}
-			}
-			sort.Strings(codes)
-			inDoc[strings.ToUpper(method)+" "+path] = strings.Join(codes, ",")
 		}
+		sort.Strings(codes)
+		inDoc[o.method+" "+o.path] = strings.Join(codes, ",")
+		secDoc[o.method+" "+o.path] = docSecurity(o.op)
 	}
 	s := &Server{}
-	inCode := map[string]string{}
+	inCode, secCode := map[string]string{}, map[string]string{}
 	for _, rt := range s.routeTable() {
 		if rt.static {
 			continue
@@ -231,12 +222,15 @@ func TestOpenAPIParity(t *testing.T) {
 		}
 		sort.Strings(codes)
 		inCode[rt.method+" "+rt.pattern] = strings.Join(codes, ",")
+		secCode[rt.method+" "+rt.pattern] = wantSecurity(rt)
 	}
 	for k, v := range inCode {
 		if d, ok := inDoc[k]; !ok {
 			t.Errorf("route %s missing from openapi.yaml", k)
 		} else if d != v {
 			t.Errorf("%s: codes in code %s, in openapi.yaml %s", k, v, d)
+		} else if secDoc[k] != secCode[k] {
+			t.Errorf("%s: security in code %s, in openapi.yaml %s", k, secCode[k], secDoc[k])
 		}
 	}
 	for k := range inDoc {

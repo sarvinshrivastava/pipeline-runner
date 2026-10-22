@@ -852,7 +852,7 @@ paths:
       operationId: heartbeatRun
       tags: [callbacks]
       summary: Extend an async run's lease
-      description: "Called by the target with its X-PLR-Run-Token, not by API clients. Extends the lease of a waiting async run, capped at the run's timeout, and returns its status. Auth: run token (X-PLR-Run-Token). 409 run_terminal or run_not_waiting."
+      description: "Called by the target with its X-PLR-Run-Token, not by API clients. Extends the lease of a waiting async run, capped at the run's timeout, and returns its status; while the target is still being called it answers without a lease. Auth: run token (X-PLR-Run-Token). 409 run_terminal or run_not_waiting."
       security: [{runToken: []}]
       responses:
         "200": {description: Lease extended (capped at the run's timeout), content: {application/json: {schema: {$ref: '#/components/schemas/HeartbeatResult'}}}}
