@@ -162,7 +162,7 @@ func TestDocsVendorPinned(t *testing.T) {
 	}
 	initJS := string(read("init.js"))
 	for _, want := range []string{`url: "/v1/openapi.json"`, "validatorUrl: null", "persistAuthorization: false",
-		"queryConfigEnabled: false", `supportedSubmitMethods: ["get", "head"]`, "requestInterceptor: guardRequest", "follow"} {
+		"queryConfigEnabled: false", `supportedSubmitMethods: ["get", "head"]`, "requestInterceptor: guardRequest", "showMutatedRequest: false", "follow"} {
 		if !strings.Contains(initJS, want) {
 			t.Errorf("init.js lacks %s", want)
 		}

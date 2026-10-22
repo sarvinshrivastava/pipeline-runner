@@ -29,4 +29,8 @@ window.ui = SwaggerUIBundle({
   // adding an Idempotency-Key guard (see the plan's Open question 2).
   supportedSubmitMethods: ["get", "head"],
   requestInterceptor: guardRequest,
+  // guardRequest throws before anything is sent. Swagger UI then has no
+  // mutated request to show and crashes rendering the response, so show the
+  // request as built instead (guardRequest never changes it).
+  showMutatedRequest: false,
 });
