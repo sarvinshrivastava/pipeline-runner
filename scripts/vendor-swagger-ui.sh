@@ -7,7 +7,8 @@
 #
 # Every download is checked against the registry's sha512 integrity. That value comes
 # from the same registry, so it catches a corrupted or swapped download, not a bad
-# release: the 14-day rule, the sha256 pins in the tests and --verify cover that.
+# release. Nothing here detects a bad release: the 14-day rule only gives one time
+# to be noticed, and the sha256 pins in the tests catch any change after vendoring.
 # Nothing from the tarball is executed, only the five files below are extracted
 # from it, and each must be a regular file (no symlinks).
 set -euo pipefail
