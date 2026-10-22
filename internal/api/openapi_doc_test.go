@@ -1125,3 +1125,29 @@ func TestOpenAPILimitDefault(t *testing.T) {
 		t.Fatalf("pageParams default %d (ok=%v), documented default %v", limit, ok, want)
 	}
 }
+
+// TestOpenAPINoNullValues: a plain scalar with a comma inside a YAML flow
+// mapping is cut at the comma and leaves null-valued keys behind.
+func TestOpenAPINoNullValues(t *testing.T) {
+	var nulls []string
+	var walk func(n any, at string)
+	walk = func(n any, at string) {
+		switch v := n.(type) {
+		case nil:
+			nulls = append(nulls, at)
+		case map[string]any:
+			for k, c := range v {
+				walk(c, at+"."+k)
+			}
+		case []any:
+			for i, c := range v {
+				walk(c, at+"["+strconv.Itoa(i)+"]")
+			}
+		}
+	}
+	walk(loadDoc(t), "")
+	sort.Strings(nulls)
+	if len(nulls) > 0 {
+		t.Fatalf("null values (quote the flow-mapping scalar): %v", nulls)
+	}
+}

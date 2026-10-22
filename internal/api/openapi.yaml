@@ -84,8 +84,8 @@ security:
   - bearer: []
 tags:
   - {name: meta, description: Health and this document}
-  - {name: jobs, description: Create, change, invoke and validate jobs}
-  - {name: runs, description: Read, follow and cancel runs; run a target once}
+  - {name: jobs, description: "Create, change, invoke and validate jobs"}
+  - {name: runs, description: "Read, follow and cancel runs; run a target once"}
   - {name: callbacks, description: Run-token routes that async targets call back on}
   - {name: clients, description: API clients and their tokens (admin only)}
   - {name: secrets, description: Vault secret names visible to the caller}
@@ -233,7 +233,7 @@ components:
                 - `internal`: an unexpected server error (logged, never detailed).
             message: {type: string}
             field: {type: string, description: The input field the error is about.}
-            status: {type: string, description: The run's status, for run conflicts.}
+            status: {type: string, description: "The run's status, for run conflicts."}
       example:
         error: {code: forbidden, message: token lacks scope jobs:write}
     Health:
@@ -261,10 +261,10 @@ components:
       required: [type]
       properties:
         type: {type: string, enum: [cron, at, delay, invoke], description: "delay is stored as at: responses never show it."}
-        cron: {type: string, description: 5 fields, or 6 with seconds (http targets only).}
-        timezone: {type: string, description: IANA zone, default UTC.}
+        cron: {type: string, description: "5 fields, or 6 with seconds (http targets only)."}
+        timezone: {type: string, description: "IANA zone, default UTC."}
         at: {type: string, format: date-time}
-        delay_sec: {type: integer, minimum: 0, description: Input only, for type delay.}
+        delay_sec: {type: integer, minimum: 0, description: "Input only, for type delay."}
     Policy:
       type: object
       properties:
@@ -340,7 +340,7 @@ components:
         name: {type: string}
         state: {type: string, enum: [active, disabled, done]}
         trigger: {$ref: '#/components/schemas/Trigger'}
-        target: {type: object, description: As created; container and inline env values are never returned, only their names as env_keys.}
+        target: {type: object, description: "As created; container and inline env values are never returned, only their names as env_keys."}
         policy: {$ref: '#/components/schemas/Policy'}
         rev: {type: integer}
         next_fires: {type: array, items: {type: string, format: date-time}, description: The next five fire times of an active job.}
@@ -427,7 +427,7 @@ components:
       required: [status]
       properties:
         status: {type: string, description: The run's status.}
-        lease_expires_at: {type: string, format: date-time, description: The extended lease, when the run holds one.}
+        lease_expires_at: {type: string, format: date-time, description: "The extended lease, when the run holds one."}
     CompleteAccepted:
       type: object
       required: [status]
@@ -436,7 +436,7 @@ components:
     InvokeRequest:
       type: object
       properties:
-        payload: {description: Any JSON, at most 256 KiB. Sent to the target as the body's payload.}
+        payload: {description: "Any JSON, at most 256 KiB. Sent to the target as the body's payload."}
         as_of: {type: string, format: date-time, description: Sets X-PLR-Scheduled-For / PLR_SCHEDULED_FOR (backfill).}
     AdhocRequest:
       type: object
@@ -445,13 +445,13 @@ components:
         client: {type: string, description: Admin token only - the client the run acts for.}
         target: {$ref: '#/components/schemas/Target'}
         policy: {$ref: '#/components/schemas/Policy'}
-        payload: {description: Any JSON, at most 256 KiB.}
+        payload: {description: "Any JSON, at most 256 KiB."}
     CompleteRequest:
       type: object
       required: [status]
       properties:
         status: {type: string, enum: [success, failed]}
-        output: {description: JSON, at most 64 KiB.}
+        output: {description: "JSON, at most 64 KiB."}
         error: {type: string, maxLength: 4096}
     RotateRequest:
       type: object
@@ -540,7 +540,7 @@ paths:
       description: Reports the runner's version, whether the engine loop is healthy, how many writes are not yet flushed, and whether the vault is reachable. Requires any valid bearer token.
       security: [{bearer: []}]
       responses:
-        "200": {description: Engine, vault and docker state, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+        "200": {description: "Engine, vault and docker state", content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
         "401": {$ref: '#/components/responses/Unauthorized'}
         "429": {$ref: '#/components/responses/RateLimited'}
         "503": {$ref: '#/components/responses/Unavailable'}
@@ -750,7 +750,7 @@ paths:
         - {$ref: '#/components/parameters/cursor'}
         - {$ref: '#/components/parameters/limit'}
         - {name: job, in: query, schema: {type: string}, description: A job id.}
-        - {name: status, in: query, schema: {type: string}, description: A run status, e.g. failed.}
+        - {name: status, in: query, schema: {type: string}, description: "A run status, e.g. failed."}
       responses:
         "200": {description: A page of runs, content: {application/json: {schema: {$ref: '#/components/schemas/RunPage'}}}}
         "400": {$ref: '#/components/responses/BadRequest'}
