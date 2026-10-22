@@ -22,7 +22,7 @@ esac
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-get() { curl -fsSL --retry 3 --retry-all-errors --max-time 120 "$@"; }
+get() { curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --max-time 120 "$@"; }
 
 # registry <mode> [version enforce-age]: list | info (prints tarball URL, then integrity).
 registry() {
