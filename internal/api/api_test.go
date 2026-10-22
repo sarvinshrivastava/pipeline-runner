@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -118,9 +119,11 @@ func newEnvWithServer(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps
 		hs.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// When a test already began Stop (maybe in a goroutine), this Stop still
-		// waits for it to finish before the store closes. Its own shutdown event
-		// may find no loop to answer it, so that part gets a short deadline.
+		// Stop always ends by waiting for the loop and the background work, so
+		// the store never closes under them, even when a test already began a
+		// Stop (maybe in a goroutine). In that case this call's shutdown event
+		// may find no loop to answer it (or replace the first one's), so it gets
+		// a short deadline; the test's own Stop then returns at its deadline.
 		stopCtx := ctx
 		select {
 		case <-e.Stopping():
@@ -624,7 +627,8 @@ func TestDocsRoutes(t *testing.T) {
 		t.Fatalf("apidocs/index.html references %d /docs/ assets, want 3", len(assets))
 	}
 	for _, m := range assets {
-		if r := raw(string(m[1])); r.status != 200 || csp(r) != cspDocs || r.header.Get("Content-Type") == "" {
+		wantType := map[string]string{".js": "text/javascript", ".css": "text/css"}[path.Ext(strings.SplitN(string(m[1]), "?", 2)[0])]
+		if r := raw(string(m[1])); r.status != 200 || csp(r) != cspDocs || wantType == "" || !strings.HasPrefix(r.header.Get("Content-Type"), wantType) {
 			t.Errorf("%s: %d csp=%q type=%q", m[1], r.status, csp(r), r.header.Get("Content-Type"))
 		}
 	}

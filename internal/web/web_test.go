@@ -157,8 +157,11 @@ func TestDocsVendorPinned(t *testing.T) {
 	if n := strings.Count(string(bundle), ".sanitize("); n != pin.sanitizeCalls {
 		t.Errorf("bundle has %d .sanitize( calls, pinned %d", n, pin.sanitizeCalls)
 	}
-	if regexp.MustCompile(`["']?IN_PLACE["']?\s*:\s*(!0|true|1|[A-Za-z_$])`).Match(bundle) {
-		t.Error("bundle sets DOMPurify IN_PLACE: check the DOMPurify advisories before vendoring")
+	// Any IN_PLACE key or assignment whose value is not a plain false.
+	for _, m := range regexp.MustCompile(`IN_PLACE["']?\]?\s*[:=]\s*([!\w$.]+)`).FindAllSubmatch(bundle, -1) {
+		if v := string(m[1]); v != "!1" && v != "false" {
+			t.Errorf("bundle sets DOMPurify IN_PLACE to %s: check the DOMPurify advisories before vendoring", v)
+		}
 	}
 
 	html := string(read("index.html"))
