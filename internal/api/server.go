@@ -122,9 +122,19 @@ func (s *Server) methodExists(r *http.Request) bool {
 	return false
 }
 
+const (
+	cspDefault = "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+	// cspDocs adds data: images only: swagger-ui.css inlines its icons as data: SVGs.
+	cspDocs = "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
+
 func securityHeaders(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
-	h.Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	csp := cspDefault
+	if strings.HasPrefix(r.URL.Path, "/docs/") {
+		csp = cspDocs
+	}
+	h.Set("Content-Security-Policy", csp)
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Content-Type-Options", "nosniff")

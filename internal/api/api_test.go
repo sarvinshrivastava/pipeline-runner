@@ -23,6 +23,7 @@ import (
 	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/target"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/vault"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/web"
 )
 
 const adminToken = "admin-token-0123456789-0123456789-xyz"
@@ -562,5 +563,60 @@ func TestSecretsFiltered(t *testing.T) {
 	}
 	if n := len(e.do("GET", "/v1/secrets", adminToken, nil).json(t)["names"].([]any)); n != 2 {
 		t.Fatalf("admin sees %d", n)
+	}
+}
+
+func TestDocsRoutes(t *testing.T) {
+	e := newEnvWith(t, nil, func(d *Deps) { d.Static = web.Handler() })
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	raw := func(path string) resp {
+		t.Helper()
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", e.url, nil)
+		req.URL.Opaque = path // sent as written: no client-side cleaning
+		r, err := noFollow.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = r.Body.Close() }()
+		b, _ := io.ReadAll(r.Body)
+		return resp{status: r.StatusCode, body: b, header: r.Header}
+	}
+	csp := func(r resp) string { return r.header.Get("Content-Security-Policy") }
+
+	if r := raw("/docs"); r.status != 301 || r.header.Get("Location") != "/docs/" {
+		t.Errorf("/docs: %d Location=%q", r.status, r.header.Get("Location"))
+	}
+	r := raw("/docs/")
+	if r.status != 200 || !strings.HasPrefix(r.header.Get("Content-Type"), "text/html") || !strings.Contains(string(r.body), `id="swagger-ui"`) || csp(r) != cspDocs {
+		t.Errorf("/docs/: %d %q csp=%q", r.status, r.header.Get("Content-Type"), csp(r))
+	}
+	r = raw("/docs/swagger-ui-bundle.js?v=" + web.DocsVersion())
+	if r.status != 200 || csp(r) != cspDocs || r.header.Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Errorf("bundle with ?v=: %d csp=%q cache=%q", r.status, csp(r), r.header.Get("Cache-Control"))
+	}
+	if r := raw("/docs/swagger-ui-bundle.js"); r.status != 200 || r.header.Get("Cache-Control") != "no-cache" {
+		t.Errorf("bundle without ?v=: %d cache=%q", r.status, r.header.Get("Cache-Control"))
+	}
+	if r := raw("/docs/nope"); r.status != 404 || r.code() != "not_found" || csp(r) != cspDocs {
+		t.Errorf("/docs/nope: %d %s csp=%q", r.status, r.body, csp(r))
+	}
+	if r := raw("/docsx"); r.status != 404 || r.code() != "not_found" || csp(r) != cspDefault {
+		t.Errorf("/docsx: %d %s csp=%q", r.status, r.body, csp(r))
+	}
+	if r := raw("/docs/../v1/status"); r.status != 307 || r.header.Get("Location") != "/v1/status" {
+		t.Errorf("/docs/../v1/status: %d Location=%q", r.status, r.header.Get("Location"))
+	}
+	if r := raw("/apidocs/index.html"); r.status != 404 || r.code() != "not_found" {
+		t.Errorf("/apidocs/index.html: %d %s", r.status, r.body)
+	}
+	for _, c := range []struct{ path, token string }{{"/v1/status", adminToken}, {"/", ""}, {"/v1/openapi.json", ""}} {
+		if r := e.do("GET", c.path, c.token, nil); r.status != 200 || csp(r) != cspDefault {
+			t.Errorf("%s: %d csp=%q", c.path, r.status, csp(r))
+		}
+	}
+
+	plain := newEnv(t)
+	if r := plain.do("GET", "/docs/", "", nil); r.status != 404 || r.code() != "not_found" {
+		t.Errorf("/docs/ without Static: %d %s", r.status, r.body)
 	}
 }

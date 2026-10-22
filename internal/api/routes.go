@@ -23,7 +23,7 @@ type route struct {
 	auth    authKind
 	scope   string
 	codes   []int // documented status codes (the parity test compares them)
-	static  bool  // dashboard asset, not part of the API document
+	static  bool  // dashboard or docs asset, not part of the API document
 	handler http.HandlerFunc
 }
 
@@ -64,6 +64,11 @@ func (s *Server) routeTable() []route {
 		{"GET", "/{$}", authNone, "", c(200), true, s.static},
 		{"GET", "/app.js", authNone, "", c(200), true, s.static},
 		{"GET", "/style.css", authNone, "", c(200), true, s.static},
+		{"GET", "/docs", authNone, "", c(301), true, s.docsRedirect},
+		{"GET", "/docs/{$}", authNone, "", c(200), true, s.static},
+		{"GET", "/docs/init.js", authNone, "", c(200), true, s.static},
+		{"GET", "/docs/swagger-ui.css", authNone, "", c(200), true, s.static},
+		{"GET", "/docs/swagger-ui-bundle.js", authNone, "", c(200), true, s.static},
 	})
 }
 
@@ -84,3 +89,9 @@ func withMiddlewareCodes(routes []route) []route {
 }
 
 func (s *Server) static(w http.ResponseWriter, r *http.Request) { s.d.Static.ServeHTTP(w, r) }
+
+// docsRedirect sends /docs to /docs/. It is explicit because ServeMux's
+// trailing-slash redirect does not apply to a {$} pattern.
+func (s *Server) docsRedirect(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/docs/", http.StatusMovedPermanently)
+}
