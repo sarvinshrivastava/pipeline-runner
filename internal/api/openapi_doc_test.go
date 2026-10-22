@@ -10,6 +10,8 @@ import (
 	"go/token"
 	"io/fs"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -500,7 +502,7 @@ func TestErrorCodesDocumented(t *testing.T) {
 	res := []*regexp.Regexp{
 		regexp.MustCompile(`writeError\(\s*w,\s*http\.Status\w+,\s*"([a-z_]+)"`),
 		regexp.MustCompile(`FieldError\{[^}]*Code: "([a-z_]+)"`),
-		regexp.MustCompile(`fieldErr\([^,]+, "([a-z_]+)"`),
+		regexp.MustCompile(`fieldErr\([^,]+,\s*"([a-z_]+)"`),
 		regexp.MustCompile(`Code\w+\s*=\s*"([a-z_]+)"`),
 	}
 	err := filepath.WalkDir("..", func(p string, d fs.DirEntry, err error) error {
@@ -861,7 +863,8 @@ var schemaDTOExempt = map[string]string{
 // differ from the Go side. Empty today.
 var schemaPropsExempt = map[string]string{}
 
-// ioAsymmetric names keys present on only one side of an output/input pair.
+// ioAsymmetric names keys (by "<label>.key", the label as in schemaDTOs) present on
+// only one side of an output/input pair.
 var ioAsymmetric = map[string]string{
 	"Trigger.delay_sec": "input-only: resolved to at on create",
 }
@@ -878,8 +881,12 @@ var (
 )
 
 // splitExempt splits an exemption key "<label>.<json key>" at its last dot.
-func splitExempt(k string) (label, key string) {
+func splitExempt(t *testing.T, k string) (label, key string) {
+	t.Helper()
 	i := strings.LastIndex(k, ".")
+	if i < 0 {
+		t.Fatalf("exemption key %q must be <label>.<json key>", k)
+	}
 	return k[:i], k[i+1:]
 }
 
@@ -907,7 +914,7 @@ func TestOpenAPISchemaPropertiesMatchDTOs(t *testing.T) {
 			}
 		}
 		for k, reason := range schemaPropsExempt {
-			if owner, key := splitExempt(k); owner == label {
+			if owner, key := splitExempt(t, k); owner == label {
 				seenPropsExempt[k] = true
 				if props[key] == union[key] {
 					t.Errorf("schemaPropsExempt %s (%s) no longer differs: remove the stale exemption", k, reason)
@@ -927,7 +934,7 @@ func TestOpenAPISchemaPropertiesMatchDTOs(t *testing.T) {
 				}
 			}
 			for k, reason := range ioAsymmetric {
-				if owner, key := splitExempt(k); owner == label {
+				if owner, key := splitExempt(t, k); owner == label {
 					seenIOExempt[k] = true
 					if out[key] == in[key] {
 						t.Errorf("ioAsymmetric %s (%s) no longer differs: remove the stale exemption", k, reason)
@@ -1098,5 +1105,16 @@ func TestOpenAPIEnumsMatchCode(t *testing.T) {
 		if !slices.Contains(opRE.FindAllString(rows[rt.scope], -1), id) {
 			t.Errorf("%s (%s) is not listed in the %s row of the scope table", id, rt.method+" "+rt.pattern, rt.scope)
 		}
+	}
+}
+
+// TestOpenAPILimitDefault ties the documented page-size default to pageParams.
+func TestOpenAPILimitDefault(t *testing.T) {
+	doc := loadDoc(t)
+	want := resolve(t, doc, map[string]any{"$ref": "#/components/parameters/limit"})["schema"].(map[string]any)["default"]
+	rec := httptest.NewRecorder()
+	_, limit, ok := pageParams(rec, httptest.NewRequest(http.MethodGet, "/v1/jobs", nil))
+	if !ok || want != limit {
+		t.Fatalf("pageParams default %d (ok=%v), documented default %v", limit, ok, want)
 	}
 }

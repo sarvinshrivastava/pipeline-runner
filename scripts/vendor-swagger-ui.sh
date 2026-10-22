@@ -103,8 +103,8 @@ case "$1" in
 *)
 	version=$1
 	fetch "$version" 1
-	# Rewrite index.html into the temp dir first: nothing in the repo changes
-	# unless every step succeeded.
+	# Download, verify and rewrite index.html in the temp dir first, so the
+	# repo is untouched unless all of that succeeded; then copy the files in.
 	python3 -I -c '
 import re, sys
 src, dst, v = sys.argv[1], sys.argv[2], sys.argv[3]
