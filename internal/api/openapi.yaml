@@ -3,33 +3,103 @@ info:
   title: pipeline-runner
   version: "1"
   description: |
-    The central time service. A job is a trigger (cron, at, delay, invoke) plus a target (an HTTP
-    callback to your service, or a container/inline script) plus a policy. Runs are fired at their
-    instant; past max_late_sec they are marked missed and paged, never run late.
+    The central time service: a job is a trigger (cron, at, delay or invoke) plus a target (an HTTP callback to your service) plus a policy. Runs fire at their instant, and a run past max_late_sec is marked missed and paged, never run late.
 
-    Callback contract (HTTP targets):
-    - Requests carry X-PLR-Run-Id, X-PLR-Job, X-PLR-Attempt, X-PLR-Trigger, X-PLR-Scheduled-For and a
-      JSON body {run_id, job, attempt, trigger, scheduled_for, payload}.
+    ## Quick rules
+
+    - Base URL: this host. Send `Authorization: Bearer <token>`; bodies are JSON in and out.
+    - Times are RFC 3339; responses use UTC.
+    - Every error is `{"error":{"code","message","field?","status?"}}`. Branch on `error.code`, not on the message.
+    - 401: fix the token. 403: missing scope or a forbidden value. 404: missing, or owned by another client.
+    - 409: read `error.code`. 413: body over 512 KiB (a payload over 256 KiB).
+    - 429 `rate_limited`: stop for 5 minutes. 429 `pending_limit` or `too_many_streams`: wait for runs or streams to finish.
+    - 503: retry with backoff.
+    - Only `createJob`, `invokeJob` and `createAdhocRun` accept `Idempotency-Key`; other writes ignore it.
+    - `listJobs` and `listRuns` are cursor pages, newest first. `listClients` and `listSecrets` return everything in one response.
+    - Interactive docs: `/docs/` (Swagger UI; Try it out is read-only).
+
+    ## Authentication
+
+    Two kinds of bearer token:
+
+    - **Admin token** (`API_TOKEN`): every scope, and it owns no client, so send `client` when it creates jobs or ad-hoc runs.
+    - **Client tokens**: returned once by `createClient`, rotatable with a grace period (`rotateClient`). A client acts only for itself, within its `callback_hosts` and `secret_ref_prefixes`.
+
+    | Scope | Operations |
+    |---|---|
+    | `jobs:read` | listJobs, getJob, validateJob, listRuns, getRun, getRunLogs |
+    | `jobs:write` | createJob, validateNewJob, patchJob, deleteJob, enableJob, disableJob, listSecrets |
+    | `runs:invoke` | invokeJob, cancelRun |
+    | `runs:adhoc` | createAdhocRun |
+    | `admin` | listClients, createClient, patchClient, deleteClient, rotateClient, and every other scope |
+
+    Ownership: another client's job or run answers 404, never 403. An admin-scoped client sees every client's jobs and runs.
+
+    The run token (`X-PLR-Run-Token`) is sent to an async target with each callback. It is valid only for that run id, on `heartbeatRun` and `completeRun`.
+
+    ## Errors
+
+    The `Error` schema lists every `error.code` with its meaning and what to do. `error.field` names the offending input field; `error.status` carries the run's status on run conflicts.
+
+    ## Rate limits and back-pressure
+
+    - 10 failed authentications (bearer or run token) from one IP within 5 minutes answer 429 `rate_limited` on every authenticated route until the window passes. There is no `Retry-After` header.
+    - More than `MAX_PENDING_PER_CLIENT` (default 1000) pending runs for a client answers 429 `pending_limit`.
+    - Live log streams: 4 per client and 128 in total, then 429 `too_many_streams`.
+
+    ## Idempotency
+
+    Only `createJob`, `invokeJob` and `createAdhocRun` honour the `Idempotency-Key` header; every other write ignores it.
+
+    - The same key with the same body, within 24 h, replays the response stored when the write committed (header `Idempotent-Replayed: true`). For invoke and ad-hoc runs that is the 202 with the run as accepted: `?wait` is not replayed.
+    - The same key with a different body answers 409 `idempotency_key_reused`.
+    - A second request while the first is still in flight answers 409 `idempotency_in_progress`.
+    - Keys are scoped per client, at most 128 characters. A failed request does not keep its key.
+
+    ## Pagination
+
+    `limit` is 1..100 (default 50). Pass the previous page's `next_cursor` as `cursor`. `next_cursor` is absent on the last page. Pages are newest first (ids are UUIDv7).
+
+    ## Async callbacks
+
+    HTTP targets are called with the headers X-PLR-Run-Id, X-PLR-Job, X-PLR-Attempt, X-PLR-Trigger and X-PLR-Scheduled-For, and a JSON body `{run_id, job, attempt, trigger, scheduled_for, payload}`.
+
     - Delivery is at-least-once by default: receivers MUST dedupe on X-PLR-Run-Id.
-    - Answer 2xx for done, 2xx {"defer_until": RFC3339} to be called again later, 429/503 with
-      Retry-After to defer, other 4xx to fail without retry, 5xx to fail (retried per policy).
-    - Async mode: answer 202 and later call POST /v1/runs/{id}/complete with the X-PLR-Run-Token you
-      received (and heartbeat to extend the lease). If you receive a duplicate X-PLR-Run-Id for work
-      still in progress, answer 202 again (not 200). Retry complete with backoff for at least 10
-      minutes if the runner is unreachable.
+    - Answer 2xx for done, 2xx `{"defer_until": RFC3339}` to be called again later, 429 or 503 with Retry-After to defer, another 4xx to fail without retry, and 5xx to fail (retried per policy).
+    - Async mode: answer 202, then call `completeRun` with the X-PLR-Run-Token you received, and `heartbeatRun` to extend the lease. If a duplicate X-PLR-Run-Id arrives for work still in progress, answer 202 again (not 200). Retry `completeRun` with backoff for at least 10 minutes if the runner is unreachable.
+
+    ## Live logs
+
+    `getRunLogs` with `follow=1` answers a Server-Sent Events stream instead of the snapshot:
+
+    - event `status`: `{"status"}` on connect and on every change.
+    - event `log`: new log bytes; its `id` is the byte offset after them. Line ends arrive as `\n`; the id counts raw file bytes. A resume more than 16 MiB behind starts with a `[N bytes skipped]` chunk.
+    - event `end`: `{"status", "reason", "successor_run_id"?}`, then the server closes. `reason` is finished, timeout (after 1 h), shutdown, unauthorized, deleted, truncated or error. finished, timeout and shutdown send the remaining bytes first. `successor_run_id` names a retry or defer that continues the run.
+    - a `: ping` comment every 15 s.
+
+    Resume with the `Last-Event-ID` header (it wins over `?offset=`). At most 4 streams per client and 128 in total (429 `too_many_streams`). The token is re-checked every 60 s. A late completion note on an interrupted run is not streamed.
 servers:
   - url: /
 security:
   - bearer: []
+tags:
+  - {name: meta, description: Health and this document}
+  - {name: jobs, description: Create, change, invoke and validate jobs}
+  - {name: runs, description: Read, follow and cancel runs; run a target once}
+  - {name: callbacks, description: Run-token routes that async targets call back on}
+  - {name: clients, description: API clients and their tokens (admin only)}
+  - {name: secrets, description: Vault secret names visible to the caller}
 components:
   securitySchemes:
     bearer:
       type: http
       scheme: bearer
+      description: The admin token (API_TOKEN) or a client token from createClient.
     runToken:
       type: apiKey
       in: header
       name: X-PLR-Run-Token
+      description: Sent to an async target with its callback; valid only for that run.
   parameters:
     id:
       name: id
@@ -55,32 +125,146 @@ components:
       in: query
       schema: {type: integer, minimum: 1, maximum: 100}
   responses:
-    Error:
-      description: Error
+    BadRequest:
+      description: "Invalid input: invalid, invalid_json, invalid_wait, required, at_in_past, cron_never_fires, header_reserved, host_not_allowed, overlap_not_allowed, too_frequent, target_not_enabled, secret_ref_missing or secret_ref_not_permitted. Fix the request; error.field names the input."
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
+    Unauthorized:
+      description: "unauthorized: the token is missing, unknown, expired or revoked. Fix the token; each failure counts toward the per-IP limit."
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Forbidden:
+      description: "forbidden: the token lacks the operation's scope, or names a client other than itself."
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: "not_found: no such resource, or it belongs to another client."
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Conflict:
+      description: "Conflict with the current state: read error.code (job_disabled, job_done, run_terminal, run_not_waiting, run_not_async, completion_conflict, job_limit, name_taken, idempotency_in_progress, idempotency_key_reused)."
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    TooLarge:
+      description: "too_large: the body is over 512 KiB, a payload over 256 KiB, or a completion output over 64 KiB."
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    RateLimited:
+      description: "rate_limited: too many failed authentications from this IP; stop for 5 minutes. pending_limit: too many pending runs; wait for some to finish."
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: "Temporarily unavailable (vault_unavailable, busy, shutting_down, unavailable). Retry with backoff."
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  examples:
+    MinimalJob:
+      summary: A cron job calling reel-drop every 5 minutes
+      value:
+        client: svc
+        name: publish-tick
+        trigger: {type: cron, cron: "*/5 * * * *", timezone: Asia/Kolkata}
+        target:
+          type: http
+          http:
+            method: POST
+            url: http://reel-drop:8080/internal/tick
+            mode: sync
+            auth: {bearer_ref: ReelDrop/TICK_TOKEN}
+        policy: {max_late_sec: 120, overlap: skip}
   schemas:
     Error:
       type: object
+      required: [error]
       properties:
         error:
           type: object
           required: [code, message]
           properties:
-            code: {type: string}
+            code:
+              type: string
+              description: |
+                Stable machine-readable code. Branch on it, not on the message.
+
+                - `invalid`: a field has a bad value; `field` names it. Fix the input.
+                - `invalid_json`: the body is not JSON, or has an unknown field. Fix the body.
+                - `invalid_wait`: `wait` is not 1..55 seconds.
+                - `required`: a required field is missing (for example `client` with the admin token).
+                - `at_in_past`: the `at` instant (or the resolved delay) is already in the past.
+                - `cron_never_fires`: the cron expression has no future fire time.
+                - `header_reserved`: a target header is reserved (for example Authorization, Host, Proxy-* or X-PLR-*).
+                - `host_not_allowed`: the target host is not in the client's `callback_hosts`.
+                - `overlap_not_allowed`: this overlap policy is not allowed for this trigger or target.
+                - `too_frequent`: the cron fires more often than allowed.
+                - `target_not_enabled`: container and inline targets are not enabled on this runner.
+                - `secret_ref_missing`: the vault has no secret under this ref.
+                - `secret_ref_not_permitted`: the ref is outside the client's `secret_ref_prefixes`.
+                - `forbidden`: the token lacks the scope, or acts for another client.
+                - `unauthorized`: missing or invalid bearer or run token.
+                - `not_found`: no such route or resource, or it belongs to another client.
+                - `method_not_allowed`: the path exists, the method does not.
+                - `too_large`: the body, payload or output is over its limit.
+                - `job_disabled`: the job is disabled; enable it first.
+                - `job_done`: a one-shot job already fired.
+                - `run_terminal`: the run already finished; `status` holds its status.
+                - `run_not_waiting`: the run is not waiting for an async completion.
+                - `run_not_async`: the run's target is not async.
+                - `completion_conflict`: a different completion was already recorded.
+                - `job_limit`: the client has too many jobs.
+                - `name_taken`: a job or client with this name exists.
+                - `client_has_jobs`: delete the client's jobs first.
+                - `idempotency_in_progress`: the first request with this key is still running; retry later.
+                - `idempotency_key_reused`: the key was used with a different body; use a new key.
+                - `rate_limited`: too many failed authentications from this IP; stop for 5 minutes.
+                - `pending_limit`: too many pending runs; wait for some to finish.
+                - `too_many_streams`: too many live log streams; close one.
+                - `vault_unavailable`: the secrets manager is unreachable; retry with backoff.
+                - `busy`: the engine is saturated; retry with backoff.
+                - `shutting_down`: the runner is restarting; retry with backoff.
+                - `unavailable`: the token could not be verified; retry shortly.
+                - `internal`: an unexpected server error (logged, never detailed).
             message: {type: string}
-            field: {type: string}
+            field: {type: string, description: The input field the error is about.}
             status: {type: string, description: The run's status, for run conflicts.}
+      example:
+        error: {code: forbidden, message: token lacks scope jobs:write}
+    Health:
+      type: object
+      required: [ok, loop_age_ms]
+      properties:
+        ok: {type: boolean, description: False when the engine loop has not ticked for 60 s.}
+        loop_age_ms: {type: integer, description: Milliseconds since the engine loop last ticked.}
+    Status:
+      type: object
+      required: [version, engine, vault, docker]
+      properties:
+        version: {type: string}
+        engine:
+          type: object
+          required: [healthy, loop_age_ms, unflushed_writes]
+          properties:
+            healthy: {type: boolean}
+            loop_age_ms: {type: integer}
+            unflushed_writes: {type: integer}
+        vault: {type: string, enum: [ok, unreachable, not_configured]}
+        docker: {type: string, description: '"disabled" unless container targets are enabled.'}
     Trigger:
       type: object
       required: [type]
       properties:
-        type: {type: string, enum: [cron, at, delay, invoke]}
+        type: {type: string, enum: [cron, at, delay, invoke], description: "delay is stored as at: responses never show it."}
         cron: {type: string, description: 5 fields, or 6 with seconds (http targets only).}
         timezone: {type: string, description: IANA zone, default UTC.}
         at: {type: string, format: date-time}
-        delay_sec: {type: integer, minimum: 0}
+        delay_sec: {type: integer, minimum: 0, description: Input only, for type delay.}
     Policy:
       type: object
       properties:
@@ -128,18 +312,18 @@ components:
       properties:
         type: {type: string, enum: [http, container, inline]}
         http: {$ref: '#/components/schemas/HTTPTarget'}
-        container: {type: object}
-        inline: {type: object}
+        container: {type: object, description: Not enabled on this runner (target_not_enabled).}
+        inline: {type: object, description: Not enabled on this runner (target_not_enabled).}
     JobCreate:
       type: object
       required: [name, trigger, target]
       properties:
         client: {type: string, description: Admin token only - the owning client's name.}
-        name: {type: string}
+        name: {type: string, description: "Lowercase letters, digits and dashes, 1-63 characters."}
         trigger: {$ref: '#/components/schemas/Trigger'}
         target: {$ref: '#/components/schemas/Target'}
         policy: {$ref: '#/components/schemas/Policy'}
-        enabled: {type: boolean}
+        enabled: {type: boolean, description: False creates the job disabled.}
     JobPatch:
       type: object
       properties:
@@ -149,6 +333,7 @@ components:
         policy: {$ref: '#/components/schemas/Policy'}
     Job:
       type: object
+      required: [id, client_id, name, state, trigger, target, policy, rev, created_at, updated_at]
       properties:
         id: {type: string}
         client_id: {type: string}
@@ -158,14 +343,33 @@ components:
         target: {type: object, description: As created; container and inline env values are never returned, only their names as env_keys.}
         policy: {$ref: '#/components/schemas/Policy'}
         rev: {type: integer}
-        next_fires: {type: array, items: {type: string, format: date-time}}
+        next_fires: {type: array, items: {type: string, format: date-time}, description: The next five fire times of an active job.}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+      example:
+        id: 0192f0c4-7a1e-7c3b-9d2f-5e8a1b2c3d4e
+        client_id: 0192f0c4-6b00-7a11-8c22-1d2e3f4a5b6c
+        name: publish-tick
+        state: active
+        trigger: {type: cron, cron: "*/5 * * * *", timezone: Asia/Kolkata}
+        target: {type: http, http: {method: POST, url: "http://reel-drop:8080/internal/tick", mode: sync, auth: {bearer_ref: ReelDrop/TICK_TOKEN}}}
+        policy: {timeout_sec: 900, max_late_sec: 120, late_warn_sec: 60, jitter_sec: 0, delivery: at_least_once, retry: {max_attempts: 1, backoff_sec: 30, max_backoff_sec: 3600}, overlap: skip, max_defer_sec: 86400, notify_on_success: false, priority: normal, push_on_failure: true}
+        rev: 1
+        next_fires: ["2026-10-22T06:35:00Z", "2026-10-22T06:40:00Z"]
+        created_at: "2026-10-22T06:31:12Z"
+        updated_at: "2026-10-22T06:31:12Z"
+    JobPage:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Job'}}
+        next_cursor: {type: string, description: Absent on the last page.}
     Run:
       type: object
+      required: [id, job_name, client_id, trigger, attempt, chain_root_id, status, scheduled_for, context_for, created_at]
       properties:
         id: {type: string}
-        job_id: {type: string}
+        job_id: {type: string, description: Absent on ad-hoc runs.}
         job_name: {type: string}
         client_id: {type: string}
         trigger: {type: string, enum: [schedule, invoke, retry, defer, adhoc]}
@@ -183,13 +387,79 @@ components:
         late_ms: {type: integer}
         http_status: {type: integer}
         exit_code: {type: integer}
-        payload: {}
-        output: {}
+        payload: {description: The invoke or ad-hoc payload (any JSON).}
+        output: {description: The target's JSON answer or completion output (any JSON).}
         output_truncated: {type: boolean}
         output_error: {type: string}
         error: {type: string}
+      example:
+        id: 0192f0c5-1d2e-7f30-8a41-b2c3d4e5f607
+        job_id: 0192f0c4-7a1e-7c3b-9d2f-5e8a1b2c3d4e
+        job_name: publish-tick
+        client_id: 0192f0c4-6b00-7a11-8c22-1d2e3f4a5b6c
+        trigger: invoke
+        attempt: 1
+        chain_root_id: 0192f0c5-1d2e-7f30-8a41-b2c3d4e5f607
+        status: success
+        scheduled_for: "2026-10-22T06:32:00Z"
+        context_for: "2026-10-22T06:32:00Z"
+        started_at: "2026-10-22T06:32:00Z"
+        finished_at: "2026-10-22T06:32:01Z"
+        late_ms: 4
+        http_status: 200
+        payload: {reason: manual}
+        output: {items: 3}
+        created_at: "2026-10-22T06:32:00Z"
+    RunPage:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Run'}}
+        next_cursor: {type: string, description: Absent on the last page.}
+    CancelAccepted:
+      type: object
+      required: [status, run]
+      properties:
+        status: {type: string, enum: [cancelling]}
+        run: {$ref: '#/components/schemas/Run'}
+    HeartbeatResult:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, description: The run's status.}
+        lease_expires_at: {type: string, format: date-time, description: The extended lease, when the run holds one.}
+    CompleteAccepted:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [accepted]}
+    InvokeRequest:
+      type: object
+      properties:
+        payload: {description: Any JSON, at most 256 KiB. Sent to the target as the body's payload.}
+        as_of: {type: string, format: date-time, description: Sets X-PLR-Scheduled-For / PLR_SCHEDULED_FOR (backfill).}
+    AdhocRequest:
+      type: object
+      required: [target]
+      properties:
+        client: {type: string, description: Admin token only - the client the run acts for.}
+        target: {$ref: '#/components/schemas/Target'}
+        policy: {$ref: '#/components/schemas/Policy'}
+        payload: {description: Any JSON, at most 256 KiB.}
+    CompleteRequest:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [success, failed]}
+        output: {description: JSON, at most 64 KiB.}
+        error: {type: string, maxLength: 4096}
+    RotateRequest:
+      type: object
+      properties:
+        grace_sec: {type: integer, minimum: 0, maximum: 3600, description: How long the old token keeps working. 0 revokes it at once.}
     Client:
       type: object
+      required: [id, name, scopes, callback_hosts, secret_ref_prefixes, repo_prefixes, container_allowed, root_allowed, created_at, updated_at]
       properties:
         id: {type: string}
         name: {type: string}
@@ -205,201 +475,295 @@ components:
     ClientIn:
       type: object
       properties:
-        name: {type: string}
+        name: {type: string, description: "Create only: lowercase letters, digits and dashes, 1-32 characters. A client cannot be renamed."}
         scopes: {type: array, items: {type: string}}
-        callback_hosts: {type: array, items: {type: string}}
-        secret_ref_prefixes: {type: array, items: {type: string}}
+        callback_hosts: {type: array, items: {type: string}, description: Hosts the client's targets may call.}
+        secret_ref_prefixes: {type: array, items: {type: string}, description: 'Vault prefixes ending in "/", or full Folder/KEY refs.'}
         repo_prefixes: {type: array, items: {type: string}}
         container_allowed: {type: boolean}
         root_allowed: {type: boolean}
         ntfy_topic: {type: string}
+    ClientList:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Client'}}
+    ClientCreated:
+      type: object
+      required: [client, token]
+      properties:
+        client: {$ref: '#/components/schemas/Client'}
+        token: {type: string, description: Shown once; store it now.}
+    TokenRotated:
+      type: object
+      required: [token, previous_valid_until]
+      properties:
+        token: {type: string, description: Shown once; store it now.}
+        previous_valid_until: {type: [string, "null"], format: date-time, description: When the old token stops working; null when grace_sec is 0.}
+    SecretNames:
+      type: object
+      required: [names]
+      properties:
+        names: {type: array, items: {type: string}}
     Report:
       type: object
+      required: [ok, checks]
       properties:
-        ok: {type: boolean}
+        ok: {type: boolean, description: True when every check passed.}
         checks: {type: array, items: {type: object, properties: {name: {type: string}, ok: {type: boolean}, detail: {type: string}}}}
         next_fires: {type: array, items: {type: string, format: date-time}}
 paths:
   /healthz:
     get:
       operationId: healthz
+      tags: [meta]
+      summary: Check that the engine loop is alive
+      description: Answers 200 while the engine loop ticked within the last 60 s, and 503 when it has stalled. For load balancers and uptime checks. No auth.
       security: []
       responses:
-        "200": {description: Engine loop alive}
-        "503": {description: Engine loop stalled for 60 s}
+        "200": {description: Engine loop alive, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}}}}
+        "503": {description: Engine loop stalled for 60 s, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}}}}
   /v1/openapi.json:
     get:
       operationId: openapi
+      tags: [meta]
+      summary: Get this OpenAPI document
+      description: Returns this whole machine-readable OpenAPI 3.1 document as JSON. It is large; the interactive view is /docs/. No auth.
       security: []
       responses:
-        "200": {description: This document}
+        "200": {description: This document, content: {application/json: {schema: {type: object}}}}
   /v1/status:
     get:
       operationId: status
+      tags: [meta]
+      summary: Get engine, vault and docker state
+      description: Reports the runner's version, whether the engine loop is healthy, how many writes are not yet flushed, and whether the vault is reachable. Requires any valid bearer token.
+      security: [{bearer: []}]
       responses:
-        "200": {description: Engine, vault and docker state}
-        "401": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: Engine, vault and docker state, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/jobs:
     get:
       operationId: listJobs
+      tags: [jobs]
+      summary: List jobs
+      description: Lists the caller's jobs as a cursor page, newest first. An admin token sees every client's jobs and may filter with client. Requires scope `jobs:read`. 400 invalid for a bad limit or an unknown client.
+      security: [{bearer: ["jobs:read"]}]
       parameters:
         - {$ref: '#/components/parameters/cursor'}
         - {$ref: '#/components/parameters/limit'}
         - {name: client, in: query, schema: {type: string}, description: Admin only.}
       responses:
-        "200": {description: A page of jobs}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: A page of jobs, content: {application/json: {schema: {$ref: '#/components/schemas/JobPage'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
     post:
       operationId: createJob
+      tags: [jobs]
+      summary: Create a job
+      description: Creates a job and returns it with its next five fire times. The admin token must name the owning client. Accepts Idempotency-Key. Requires scope `jobs:write`. 400 lists the invalid field (host_not_allowed, secret_ref_missing, too_frequent, ...); 409 name_taken or job_limit.
+      security: [{bearer: ["jobs:write"]}]
       parameters: [{$ref: '#/components/parameters/idempotencyKey'}]
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/JobCreate'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/JobCreate'}
+            examples:
+              minimal: {$ref: '#/components/examples/MinimalJob'}
       responses:
         "201": {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "413": {$ref: '#/components/responses/TooLarge'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "429": {$ref: '#/components/responses/RateLimited'}
   /v1/jobs/validate:
     post:
       operationId: validateNewJob
-      description: Dry run of createJob; nothing is stored.
+      tags: [jobs]
+      summary: Dry-run a job create
+      description: Validates a createJob body and runs the job's checks (hosts, secrets, schedule) without storing anything. A job that would be refused still answers 200, with ok false and the failing check. Requires scope `jobs:write`.
+      security: [{bearer: ["jobs:write"]}]
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/JobCreate'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/JobCreate'}
+            examples:
+              minimal: {$ref: '#/components/examples/MinimalJob'}
       responses:
         "200": {description: Report, content: {application/json: {schema: {$ref: '#/components/schemas/Report'}}}}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "413": {$ref: '#/components/responses/TooLarge'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/jobs/{id}:
     parameters: [{$ref: '#/components/parameters/id'}]
     get:
       operationId: getJob
+      tags: [jobs]
+      summary: Get a job
+      description: Returns one job; an active job includes its next five fire times. Container and inline env values are never returned. Requires scope `jobs:read`.
+      security: [{bearer: ["jobs:read"]}]
       responses:
         "200": {description: The job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
     patch:
       operationId: patchJob
-      description: Replaces whichever of trigger, target, policy, name are present. An absent target.env keeps the stored env.
+      tags: [jobs]
+      summary: Change a job
+      description: Replaces whichever of trigger, target, policy and name are present. An absent target.env keeps the stored env. A policy is replaced whole, except that omitted push_url_ref and push_on_failure are kept. Requires scope `jobs:write`. 409 name_taken.
+      security: [{bearer: ["jobs:write"]}]
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/JobPatch'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/JobPatch'}
+            examples:
+              lateAndSkip:
+                summary: Allow 5 minutes of lateness and skip overlapping runs
+                value: {policy: {max_late_sec: 300, overlap: skip}}
+              withKumaPush:
+                summary: Also ping an Uptime Kuma push URL after each run
+                value: {policy: {max_late_sec: 300, overlap: skip, push_url_ref: ReelDrop/KUMA_PUSH}}
       responses:
-        "200": {description: Updated}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
+        "200": {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "413": {$ref: '#/components/responses/TooLarge'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "429": {$ref: '#/components/responses/RateLimited'}
     delete:
       operationId: deleteJob
-      description: Cancels the job's pending, waiting and running runs; run history is kept.
+      tags: [jobs]
+      summary: Delete a job
+      description: Deletes the job and cancels its pending, waiting and running runs. Run history is kept. Requires scope `jobs:write`.
+      security: [{bearer: ["jobs:write"]}]
       responses:
         "204": {description: Deleted}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/jobs/{id}/invoke:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: invokeJob
+      tags: [jobs]
+      summary: Run a job now
+      description: Queues a run of the job now, with an optional payload. Answers 202 with the run, or with wait, 200 with the finished run if the chain ends in time. Accepts Idempotency-Key. Requires scope `runs:invoke`. 409 job_disabled or job_done; 429 pending_limit.
+      security: [{bearer: ["runs:invoke"]}]
       parameters:
         - {$ref: '#/components/parameters/wait'}
         - {$ref: '#/components/parameters/idempotencyKey'}
       requestBody:
         content:
           application/json:
-            schema:
-              type: object
-              properties:
-                payload: {description: Any JSON, at most 256 KiB.}
-                as_of: {type: string, format: date-time, description: Sets X-PLR-Scheduled-For / PLR_SCHEDULED_FOR (backfill).}
+            schema: {$ref: '#/components/schemas/InvokeRequest'}
+            examples:
+              manual:
+                summary: A manual run with a payload
+                value: {payload: {reason: manual}}
       responses:
         "200": {description: Finished within wait, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
         "202": {description: "Accepted (poll GET /v1/runs/{id})", content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "413": {$ref: '#/components/responses/TooLarge'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "429": {$ref: '#/components/responses/RateLimited'}
   /v1/jobs/{id}/enable:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: enableJob
+      tags: [jobs]
+      summary: Enable a job
+      description: Enables a disabled job; its schedule resumes from now, and missed fire times are not replayed. Requires scope `jobs:write`. 409 job_done for a one-shot job that already fired.
+      security: [{bearer: ["jobs:write"]}]
       responses:
-        "200": {description: Enabled}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: Enabled, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/jobs/{id}/disable:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: disableJob
+      tags: [jobs]
+      summary: Disable a job
+      description: Disables the job and cancels its pending scheduled, retry and defer runs; a running run finishes. Invoking a disabled job answers 409 job_disabled. Requires scope `jobs:write`.
+      security: [{bearer: ["jobs:write"]}]
       responses:
-        "200": {description: Disabled; pending runs cancelled}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: Disabled; pending runs cancelled, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/jobs/{id}/validate:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: validateJob
+      tags: [jobs]
+      summary: Re-check a stored job
+      description: Runs the stored job's checks again (hosts, secrets, schedule) against the owning client's current limits, and returns the report with the next five fire times. Nothing changes. Requires scope `jobs:read`.
+      security: [{bearer: ["jobs:read"]}]
       responses:
         "200": {description: Report, content: {application/json: {schema: {$ref: '#/components/schemas/Report'}}}}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/runs:
     get:
       operationId: listRuns
+      tags: [runs]
+      summary: List runs
+      description: Lists the caller's runs as a cursor page, newest first, optionally filtered by job id and status. An admin token sees every client's runs. Requires scope `jobs:read`. 400 invalid for a bad limit or an unknown status.
+      security: [{bearer: ["jobs:read"]}]
       parameters:
         - {$ref: '#/components/parameters/cursor'}
         - {$ref: '#/components/parameters/limit'}
-        - {name: job, in: query, schema: {type: string}}
-        - {name: status, in: query, schema: {type: string}}
+        - {name: job, in: query, schema: {type: string}, description: A job id.}
+        - {name: status, in: query, schema: {type: string}, description: A run status, e.g. failed.}
       responses:
-        "200": {description: A page of runs}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: A page of runs, content: {application/json: {schema: {$ref: '#/components/schemas/RunPage'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
     post:
       operationId: createAdhocRun
-      description: Run a target once without creating a job. Needs the runs:adhoc scope.
+      tags: [runs]
+      summary: Run a target once without a job
+      description: Runs a target once without creating a job. The admin token must name the client; the target host must be in that client's callback_hosts. Push fields are refused. Accepts Idempotency-Key. Requires scope `runs:adhoc`. 429 pending_limit.
+      security: [{bearer: ["runs:adhoc"]}]
       parameters:
         - {$ref: '#/components/parameters/wait'}
         - {$ref: '#/components/parameters/idempotencyKey'}
@@ -407,191 +771,233 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [target]
-              properties:
-                client: {type: string}
-                target: {$ref: '#/components/schemas/Target'}
-                policy: {$ref: '#/components/schemas/Policy'}
-                payload: {}
+            schema: {$ref: '#/components/schemas/AdhocRequest'}
+            examples:
+              tick:
+                summary: Call reel-drop's tick endpoint once
+                value:
+                  client: svc
+                  target: {type: http, http: {method: POST, url: "http://reel-drop:8080/internal/tick", auth: {bearer_ref: ReelDrop/TICK_TOKEN}}}
+                  payload: {reason: manual}
       responses:
-        "200": {description: Finished within wait}
-        "202": {description: Accepted}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
+        "200": {description: Finished within wait, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
+        "202": {description: Accepted, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "413": {$ref: '#/components/responses/TooLarge'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "429": {$ref: '#/components/responses/RateLimited'}
   /v1/runs/{id}:
     parameters: [{$ref: '#/components/parameters/id'}]
     get:
       operationId: getRun
+      tags: [runs]
+      summary: Get a run
+      description: Returns one run with its status, timing, payload and output. Poll it after a 202 from invokeJob or createAdhocRun. Requires scope `jobs:read`.
+      security: [{bearer: ["jobs:read"]}]
       responses:
         "200": {description: The run, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/runs/{id}/logs:
     parameters: [{$ref: '#/components/parameters/id'}]
     get:
       operationId: getRunLogs
+      tags: [runs]
+      summary: Get or follow a run's log
       description: |
-        Without follow, the log so far as plain text (up to 16 MiB). With follow=1, a live
-        Server-Sent Events stream instead of polling:
-          - event "status": {"status"} on connect and on every change.
-          - event "log": new log bytes; "id" is the byte offset after them. Line ends arrive
-            as \n; the id counts raw file bytes. A resume beyond 16 MiB behind starts with a
-            "[N bytes skipped]" chunk.
-          - event "end": {"status", "reason", "successor_run_id"?}, then the server closes.
-            reason is finished | timeout (after 1 h) | shutdown | unauthorized | deleted |
-            truncated | error. finished, timeout and shutdown send the remaining bytes first.
-            successor_run_id names a retry or defer that continues the run.
-          - a ": ping" comment every 15 s.
-        Resume with the Last-Event-ID header (it wins over ?offset=). At most 4 streams per
-        client and 128 in total (429 too_many_streams). The token is re-checked every 60 s.
-        A late completion note on an interrupted run is not streamed.
+        Without follow, the log so far as plain text, up to 16 MiB (container output, or a request/response summary for HTTP runs); a pending run has an empty log. With follow=1, a Server-Sent Events stream instead (see Live logs). follow=1 is refused by the /docs page: use curl -N. Requires scope `jobs:read`. 429 too_many_streams: close a stream first.
+      security: [{bearer: ["jobs:read"]}]
       parameters:
-        - {name: follow, in: query, schema: {type: string, enum: ["0", "1", "true", "false"]}}
-        - {name: offset, in: query, schema: {type: integer, minimum: 0}}
-        - {name: Last-Event-ID, in: header, schema: {type: string}}
+        - {name: follow, in: query, schema: {type: string, enum: ["0", "1", "true", "false"]}, description: 1 or true streams Server-Sent Events.}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0}, description: Byte offset to start a stream from.}
+        - {name: Last-Event-ID, in: header, schema: {type: string}, description: Resume a stream after this event id (wins over offset).}
       responses:
-        "200": {description: "Plain-text log (container output, or a request/response summary for HTTP runs), or with follow=1 an event stream", content: {text/plain: {}, text/event-stream: {}}}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200":
+          description: "Plain-text log (container output, or a request/response summary for HTTP runs), or with follow=1 an event stream"
+          content:
+            text/plain: {schema: {type: string}}
+            text/event-stream: {schema: {type: string}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {description: "rate_limited (failed authentications), or too_many_streams: 4 streams per client or 128 in total are open", content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/runs/{id}/cancel:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: cancelRun
+      tags: [runs]
+      summary: Cancel a run
+      description: Cancels a run. A pending or waiting run is cancelled at once (200 with the run). A running run is signalled (202 with status cancelling; repeat to check). Requires scope `runs:invoke`. 409 run_terminal when it already finished, with error.status holding its status.
+      security: [{bearer: ["runs:invoke"]}]
       responses:
-        "200": {description: A pending or waiting run was cancelled}
-        "202": {description: A running run is being cancelled (repeatable)}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
+        "200": {description: A pending or waiting run was cancelled, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
+        "202": {description: A running run is being cancelled (repeatable), content: {application/json: {schema: {$ref: '#/components/schemas/CancelAccepted'}}}}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
         "409": {description: "The run is already terminal (error.status holds its status)", content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/runs/{id}/heartbeat:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: heartbeatRun
+      tags: [callbacks]
+      summary: Extend an async run's lease
+      description: "Called by the target with its X-PLR-Run-Token, not by API clients. Extends the lease of a waiting async run, capped at the run's timeout, and returns its status. Auth: run token (X-PLR-Run-Token). 409 run_terminal or run_not_waiting."
       security: [{runToken: []}]
       responses:
-        "200": {description: Lease extended (capped at the run's timeout)}
-        "401": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: Lease extended (capped at the run's timeout), content: {application/json: {schema: {$ref: '#/components/schemas/HeartbeatResult'}}}}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/runs/{id}/complete:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: completeRun
+      tags: [callbacks]
+      summary: Report an async run's result
+      description: "Called by the target with its X-PLR-Run-Token, not by API clients. Records the async result (success or failed, with optional output). 202 when it arrives before the runner saw the target's 202; it is applied then. Auth: run token (X-PLR-Run-Token). 409 run_terminal or completion_conflict."
       security: [{runToken: []}]
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [status]
-              properties:
-                status: {type: string, enum: [success, failed]}
-                output: {description: JSON, at most 64 KiB.}
-                error: {type: string, maxLength: 4096}
+            schema: {$ref: '#/components/schemas/CompleteRequest'}
+            examples:
+              success:
+                summary: A successful completion with output
+                value: {status: success, output: {items: 3}}
       responses:
-        "200": {description: Recorded}
-        "202": {description: Recorded before the runner saw your 202; applied when it does}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: Recorded, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}
+        "202": {description: Recorded before the runner saw your 202; applied when it does, content: {application/json: {schema: {$ref: '#/components/schemas/CompleteAccepted'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "413": {$ref: '#/components/responses/TooLarge'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/clients:
     get:
       operationId: listClients
+      tags: [clients]
+      summary: List clients
+      description: Lists every API client by name, in one response. Token hashes are never returned. Requires scope `admin`.
+      security: [{bearer: ["admin"]}]
       responses:
-        "200": {description: Clients}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "200": {description: Clients, content: {application/json: {schema: {$ref: '#/components/schemas/ClientList'}}}}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
     post:
       operationId: createClient
+      tags: [clients]
+      summary: Create a client
+      description: Creates an API client with its scopes and limits, and returns its token once. Store the token now; only its hash is kept. Requires scope `admin`. 409 name_taken.
+      security: [{bearer: ["admin"]}]
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/ClientIn'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ClientIn'}
+            examples:
+              reelDrop:
+                summary: A service that schedules and invokes its own jobs
+                value: {name: reel-drop, scopes: ["jobs:read", "jobs:write", "runs:invoke"], callback_hosts: [reel-drop], secret_ref_prefixes: [ReelDrop/]}
       responses:
-        "201": {description: Created; the token is shown once}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "409": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
+        "201": {description: Created; the token is shown once, content: {application/json: {schema: {$ref: '#/components/schemas/ClientCreated'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "413": {$ref: '#/components/responses/TooLarge'}
   /v1/clients/{id}:
     parameters: [{$ref: '#/components/parameters/id'}]
     patch:
       operationId: patchClient
+      tags: [clients]
+      summary: Change a client's scopes or limits
+      description: Replaces whichever client fields are present (scopes, callback_hosts, secret_ref_prefixes, ...). A client cannot be renamed; lists are replaced whole. Requires scope `admin`.
+      security: [{bearer: ["admin"]}]
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/ClientIn'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ClientIn'}
+            examples:
+              addWorker:
+                summary: Allow a second callback host
+                value: {callback_hosts: [reel-drop, reel-drop-worker]}
       responses:
-        "200": {description: Updated}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
+        "200": {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/Client'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "413": {$ref: '#/components/responses/TooLarge'}
     delete:
       operationId: deleteClient
+      tags: [clients]
+      summary: Delete a client
+      description: Deletes a client and revokes its token. A client that still owns jobs answers 409 client_has_jobs; delete its jobs first. Requires scope `admin`.
+      security: [{bearer: ["admin"]}]
       responses:
         "204": {description: Deleted}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
         "409": {description: The client still owns jobs, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
   /v1/clients/{id}/rotate:
     parameters: [{$ref: '#/components/parameters/id'}]
     post:
       operationId: rotateClient
+      tags: [clients]
+      summary: Rotate a client's token
+      description: Issues a new token for the client and returns it once. The old token keeps working for grace_sec seconds (0 revokes it at once). Requires scope `admin`.
+      security: [{bearer: ["admin"]}]
       requestBody:
         content:
           application/json:
-            schema:
-              type: object
-              properties:
-                grace_sec: {type: integer, minimum: 0, maximum: 3600, description: How long the old token keeps working.}
+            schema: {$ref: '#/components/schemas/RotateRequest'}
+            examples:
+              fiveMinutes:
+                summary: Keep the old token for 5 minutes
+                value: {grace_sec: 300}
       responses:
-        "200": {description: New token (shown once)}
-        "400": {$ref: '#/components/responses/Error'}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "404": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "413": {$ref: '#/components/responses/Error'}
+        "200": {description: New token (shown once), content: {application/json: {schema: {$ref: '#/components/schemas/TokenRotated'}}}}
+        "400": {$ref: '#/components/responses/BadRequest'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/RateLimited'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "413": {$ref: '#/components/responses/TooLarge'}
   /v1/secrets:
     get:
       operationId: listSecrets
-      description: Secret names (never values) under the caller's secret_ref_prefixes.
+      tags: [secrets]
+      summary: List secret names
+      description: Lists vault secret names (never values) under the caller's secret_ref_prefixes; the admin token sees every name. Use them as bearer_ref, hmac_ref or push_url_ref. Requires scope `jobs:write`. 503 vault_unavailable.
+      security: [{bearer: ["jobs:write"]}]
       responses:
-        "200": {description: Names}
-        "401": {$ref: '#/components/responses/Error'}
-        "403": {$ref: '#/components/responses/Error'}
-        "503": {$ref: '#/components/responses/Error'}
-        "429": {$ref: '#/components/responses/Error'}
+        "200": {description: Names, content: {application/json: {schema: {$ref: '#/components/schemas/SecretNames'}}}}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "503": {$ref: '#/components/responses/Unavailable'}
+        "429": {$ref: '#/components/responses/RateLimited'}
