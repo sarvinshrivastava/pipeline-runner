@@ -5,8 +5,11 @@
 #   scripts/vendor-swagger-ui.sh --list-eligible print the versions that pass that rule, newest last
 #   scripts/vendor-swagger-ui.sh --verify        compare the vendored files with the registry tarball (CI)
 #
-# Every download is checked against the registry's sha512 integrity. Nothing from the
-# tarball is executed, and only the five files below are extracted from it.
+# Every download is checked against the registry's sha512 integrity. That value comes
+# from the same registry, so it catches a corrupted or swapped download, not a bad
+# release: the 14-day rule, the sha256 pins in the tests and --verify cover that.
+# Nothing from the tarball is executed, only the five files below are extracted
+# from it, and each must be a regular file (no symlinks).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -81,6 +84,12 @@ fetch() {
 	fi
 	mkdir "$tmp/x"
 	tar -xzf "$tmp/p.tgz" -C "$tmp/x" "${files[@]/#/package/}"
+	for f in "${files[@]}"; do
+		if [ -L "$tmp/x/package/$f" ] || [ ! -f "$tmp/x/package/$f" ]; then
+			echo "package/$f in the tarball is not a regular file" >&2
+			exit 1
+		fi
+	done
 }
 
 get https://registry.npmjs.org/swagger-ui-dist -o "$tmp/meta.json"
