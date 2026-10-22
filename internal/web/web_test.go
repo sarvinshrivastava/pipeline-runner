@@ -157,11 +157,8 @@ func TestDocsVendorPinned(t *testing.T) {
 	if n := strings.Count(string(bundle), ".sanitize("); n != pin.sanitizeCalls {
 		t.Errorf("bundle has %d .sanitize( calls, pinned %d", n, pin.sanitizeCalls)
 	}
-	// Any IN_PLACE key or assignment whose value is not a plain false.
-	for _, m := range regexp.MustCompile(`IN_PLACE["']?\]?\s*[:=]\s*([!\w$.]+)`).FindAllSubmatch(bundle, -1) {
-		if v := string(m[1]); v != "!1" && v != "false" {
-			t.Errorf("bundle sets DOMPurify IN_PLACE to %s: check the DOMPurify advisories before vendoring", v)
-		}
+	if v := inPlaceSet(bundle); v != "" {
+		t.Errorf("bundle sets DOMPurify IN_PLACE to %s: check the DOMPurify advisories before vendoring", v)
 	}
 
 	html := string(read("index.html"))
@@ -188,5 +185,40 @@ func TestDocsVendorPinned(t *testing.T) {
 	}
 	if _, err := fs.Stat(Files(), "docs"); err == nil {
 		t.Error("static/docs exists: .git/info/exclude ignores docs/, so it would never be committed")
+	}
+}
+
+// inPlaceRE finds an IN_PLACE key or assignment (not a comparison) and its
+// whole value expression, up to the next , ; } or ).
+var inPlaceRE = regexp.MustCompile("IN_PLACE[\"'`]?\\]?\\s*(?::|=([^=]|$))\\s*([^,;})]*)")
+
+// inPlaceSet returns the first IN_PLACE value that is not exactly !1 or
+// false, or "".
+func inPlaceSet(src []byte) string {
+	for _, m := range inPlaceRE.FindAllSubmatch(src, -1) {
+		v := strings.TrimSpace(string(m[1]) + string(m[2]))
+		if v != "!1" && v != "false" {
+			return v
+		}
+	}
+	return ""
+}
+
+func TestInPlaceTripwire(t *testing.T) {
+	for src, want := range map[string]string{
+		"{IN_PLACE:!0}":            "!0",
+		`["IN_PLACE"]=!0;`:         "!0",
+		"s.IN_PLACE=x,":            "x",
+		"{IN_PLACE:!1||cfg}":       "!1||cfg",
+		"{IN_PLACE:(0,f)()}":       "(0",
+		`{"IN_PLACE": "1"}`:        `"1"`,
+		"{IN_PLACE:!1}":            "",
+		"{IN_PLACE:false,x:1}":     "",
+		"x.IN_PLACE===!0":          "",
+		"Pt=s.IN_PLACE||!1,rt=fun": "",
+	} {
+		if got := inPlaceSet([]byte(src)); got != want {
+			t.Errorf("inPlaceSet(%q) = %q, want %q", src, got, want)
+		}
 	}
 }

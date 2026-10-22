@@ -1111,10 +1111,17 @@ func TestOpenAPIEnumsMatchCode(t *testing.T) {
 // TestOpenAPILimitDefault ties the documented page-size default to pageParams.
 func TestOpenAPILimitDefault(t *testing.T) {
 	doc := loadDoc(t)
-	want := resolve(t, doc, map[string]any{"$ref": "#/components/parameters/limit"})["schema"].(map[string]any)["default"]
+	schema, ok := resolve(t, doc, map[string]any{"$ref": "#/components/parameters/limit"})["schema"].(map[string]any)
+	if !ok {
+		t.Fatal("components.parameters.limit has no schema")
+	}
+	want, ok := schema["default"].(int)
+	if !ok {
+		t.Fatalf("components.parameters.limit.schema.default = %v, want an integer", schema["default"])
+	}
 	rec := httptest.NewRecorder()
 	_, limit, ok := pageParams(rec, httptest.NewRequest(http.MethodGet, "/v1/jobs", nil))
-	if !ok || want != limit {
+	if !ok || limit != want {
 		t.Fatalf("pageParams default %d (ok=%v), documented default %v", limit, ok, want)
 	}
 }
