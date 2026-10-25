@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,14 +20,13 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/sarvinshrivastava/pipeline-runner/internal/engine"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/model"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/secure"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/store"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/target"
 	"github.com/sarvinshrivastava/pipeline-runner/internal/vault"
+	"github.com/sarvinshrivastava/pipeline-runner/internal/web"
 )
 
 const adminToken = "admin-token-0123456789-0123456789-xyz"
@@ -117,7 +119,20 @@ func newEnvWithServer(t *testing.T, engMod func(*engine.Deps), apiMod func(*Deps
 		hs.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		e.Stop(ctx, time.Now())
+		// Stop always ends by waiting for the loop and the background work, so
+		// the store never closes under them, even when a test already began a
+		// Stop (maybe in a goroutine). In that case this call's shutdown event
+		// may find no loop to answer it (or replace the first one's), so it gets
+		// a short deadline; the test's own Stop then returns at its deadline.
+		stopCtx := ctx
+		select {
+		case <-e.Stopping():
+			var stopCancel context.CancelFunc
+			stopCtx, stopCancel = context.WithTimeout(ctx, 200*time.Millisecond)
+			defer stopCancel()
+		default:
+		}
+		e.Stop(stopCtx, time.Now())
 		_ = st.Close()
 	})
 	return &env{t: t, url: hs.URL, exec: ex, st: st, srv: s, eng: e}
@@ -195,32 +210,21 @@ var all = []string{"jobs:read", "jobs:write", "runs:invoke", "runs:adhoc"}
 // ---------------------------------------------------------------- tests
 
 func TestOpenAPIParity(t *testing.T) {
-	var doc struct {
-		Paths map[string]map[string]any `yaml:"paths"`
-	}
-	if err := yaml.Unmarshal(openapiYAML, &doc); err != nil {
-		t.Fatal(err)
-	}
-	inDoc := map[string]string{}
-	for path, ops := range doc.Paths {
-		for method, op := range ops {
-			if method == "parameters" {
-				continue
+	doc := loadDoc(t)
+	inDoc, secDoc := map[string]string{}, map[string]string{}
+	for _, o := range ops(t, doc) {
+		var codes []string
+		if rs, ok := o.op["responses"].(map[string]any); ok {
+			for c := range rs {
+				codes = append(codes, c)
 			}
-			var codes []string
-			if m, ok := op.(map[string]any); ok {
-				if rs, ok := m["responses"].(map[string]any); ok {
-					for c := range rs {
-						codes = append(codes, c)
-					}
-				}
-			}
-			sort.Strings(codes)
-			inDoc[strings.ToUpper(method)+" "+path] = strings.Join(codes, ",")
 		}
+		sort.Strings(codes)
+		inDoc[o.method+" "+o.path] = strings.Join(codes, ",")
+		secDoc[o.method+" "+o.path] = docSecurity(o.op)
 	}
 	s := &Server{}
-	inCode := map[string]string{}
+	inCode, secCode := map[string]string{}, map[string]string{}
 	for _, rt := range s.routeTable() {
 		if rt.static {
 			continue
@@ -231,12 +235,17 @@ func TestOpenAPIParity(t *testing.T) {
 		}
 		sort.Strings(codes)
 		inCode[rt.method+" "+rt.pattern] = strings.Join(codes, ",")
+		secCode[rt.method+" "+rt.pattern] = wantSecurity(rt)
 	}
 	for k, v := range inCode {
 		if d, ok := inDoc[k]; !ok {
 			t.Errorf("route %s missing from openapi.yaml", k)
+			continue
 		} else if d != v {
 			t.Errorf("%s: codes in code %s, in openapi.yaml %s", k, v, d)
+		}
+		if secDoc[k] != secCode[k] {
+			t.Errorf("%s: security in code %s, in openapi.yaml %s", k, secCode[k], secDoc[k])
 		}
 	}
 	for k := range inDoc {
@@ -568,5 +577,81 @@ func TestSecretsFiltered(t *testing.T) {
 	}
 	if n := len(e.do("GET", "/v1/secrets", adminToken, nil).json(t)["names"].([]any)); n != 2 {
 		t.Fatalf("admin sees %d", n)
+	}
+}
+
+func TestDocsRoutes(t *testing.T) {
+	e := newEnvWith(t, nil, func(d *Deps) { d.Static = web.Handler() })
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	raw := func(path string) resp {
+		t.Helper()
+		req, err := http.NewRequestWithContext(context.Background(), "GET", e.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.URL.Opaque = path // sent as written: no client-side cleaning
+		r, err := noFollow.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = r.Body.Close() }()
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp{status: r.StatusCode, body: b, header: r.Header}
+	}
+	csp := func(r resp) string { return r.header.Get("Content-Security-Policy") }
+
+	if r := raw("/docs"); r.status != 301 || r.header.Get("Location") != "/docs/" {
+		t.Errorf("/docs: %d Location=%q", r.status, r.header.Get("Location"))
+	}
+	r := raw("/docs/")
+	if r.status != 200 || !strings.HasPrefix(r.header.Get("Content-Type"), "text/html") || !strings.Contains(string(r.body), `id="swagger-ui"`) || csp(r) != cspDocs {
+		t.Errorf("/docs/: %d %q csp=%q", r.status, r.header.Get("Content-Type"), csp(r))
+	}
+	r = raw("/docs/swagger-ui-bundle.js?v=" + web.DocsVersion())
+	if r.status != 200 || csp(r) != cspDocs || r.header.Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Errorf("bundle with ?v=: %d csp=%q cache=%q", r.status, csp(r), r.header.Get("Cache-Control"))
+	}
+	if r := raw("/docs/swagger-ui-bundle.js"); r.status != 200 || r.header.Get("Cache-Control") != "no-cache" {
+		t.Errorf("bundle without ?v=: %d cache=%q", r.status, r.header.Get("Cache-Control"))
+	}
+	// Every asset the docs page references is routed through the server.
+	page, err := fs.ReadFile(web.Files(), "apidocs/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assets := regexp.MustCompile(`(?:src|href)="(/docs/[^"]+)"`).FindAllSubmatch(page, -1)
+	if len(assets) != 3 {
+		t.Fatalf("apidocs/index.html references %d /docs/ assets, want 3", len(assets))
+	}
+	for _, m := range assets {
+		wantType := map[string]string{".js": "text/javascript", ".css": "text/css"}[path.Ext(strings.SplitN(string(m[1]), "?", 2)[0])]
+		if r := raw(string(m[1])); r.status != 200 || csp(r) != cspDocs || wantType == "" || !strings.HasPrefix(r.header.Get("Content-Type"), wantType) {
+			t.Errorf("%s: %d csp=%q type=%q", m[1], r.status, csp(r), r.header.Get("Content-Type"))
+		}
+	}
+	if r := raw("/docs/nope"); r.status != 404 || r.code() != "not_found" || csp(r) != cspDocs {
+		t.Errorf("/docs/nope: %d %s csp=%q", r.status, r.body, csp(r))
+	}
+	if r := raw("/docsx"); r.status != 404 || r.code() != "not_found" || csp(r) != cspDefault {
+		t.Errorf("/docsx: %d %s csp=%q", r.status, r.body, csp(r))
+	}
+	if r := raw("/docs/../v1/status"); r.status != 307 || r.header.Get("Location") != "/v1/status" {
+		t.Errorf("/docs/../v1/status: %d Location=%q", r.status, r.header.Get("Location"))
+	}
+	if r := raw("/apidocs/index.html"); r.status != 404 || r.code() != "not_found" {
+		t.Errorf("/apidocs/index.html: %d %s", r.status, r.body)
+	}
+	for _, c := range []struct{ path, token string }{{"/v1/status", adminToken}, {"/", ""}, {"/v1/openapi.json", ""}} {
+		if r := e.do("GET", c.path, c.token, nil); r.status != 200 || csp(r) != cspDefault {
+			t.Errorf("%s: %d csp=%q", c.path, r.status, csp(r))
+		}
+	}
+
+	plain := newEnv(t)
+	if r := plain.do("GET", "/docs/", "", nil); r.status != 404 || r.code() != "not_found" {
+		t.Errorf("/docs/ without Static: %d %s", r.status, r.body)
 	}
 }

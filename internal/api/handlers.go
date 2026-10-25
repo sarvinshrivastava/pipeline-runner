@@ -759,14 +759,17 @@ func (s *Server) deleteClient(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// rotateReq is the body of POST /v1/clients/{id}/rotate.
+type rotateReq struct {
+	GraceSec int `json:"grace_sec"`
+}
+
 func (s *Server) rotateClient(w http.ResponseWriter, r *http.Request) {
 	body, ok := readBody(w, r)
 	if !ok {
 		return
 	}
-	var in struct {
-		GraceSec int `json:"grace_sec"`
-	}
+	var in rotateReq
 	if !decodeStrict(w, body, &in) {
 		return
 	}

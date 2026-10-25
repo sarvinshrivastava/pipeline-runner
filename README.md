@@ -44,7 +44,7 @@ Every callback carries `X-PLR-Run-Id`, `X-PLR-Job`, `X-PLR-Trigger`, `X-PLR-Atte
 
 ## API
 
-OpenAPI: `GET /v1/openapi.json`. Auth is `Authorization: Bearer <token>`. The admin token comes from `API_TOKEN`; per-client tokens come from `POST /v1/clients`.
+Reference: **`/docs/`** (Swagger UI) and **`/v1/openapi.json`** (OpenAPI 3.1), both generated from `internal/api/openapi.yaml`. `/docs` Try it out is GET-only; `follow=1` is refused there. Auth is `Authorization: Bearer <token>`. The admin token comes from `API_TOKEN`; per-client tokens come from `POST /v1/clients`.
 
 | Area | Endpoints | Scope |
 |---|---|---|
@@ -52,7 +52,7 @@ OpenAPI: `GET /v1/openapi.json`. Auth is `Authorization: Bearer <token>`. The ad
 | Runs | `GET /v1/runs`, `GET /v1/runs/{id}`, `GET /v1/runs/{id}/logs`, `POST /v1/runs/{id}/cancel`, `POST /v1/runs` (ad hoc) | `jobs:read`, `runs:invoke`, `runs:adhoc` |
 | Async callbacks | `POST /v1/runs/{id}/heartbeat`, `POST /v1/runs/{id}/complete` | run token |
 | Clients | `GET/POST /v1/clients`, `PATCH/DELETE /v1/clients/{id}`, `POST /v1/clients/{id}/rotate` | `admin` |
-| Other | `GET /healthz`, `GET /v1/status`, `GET /v1/secrets` | none / bearer / `jobs:write` |
+| Other | `GET /healthz`, `GET /docs/`, `GET /v1/status`, `GET /v1/secrets` | none / none / bearer / `jobs:write` |
 
 **Client limits:** each client is limited to its own `callback_hosts` and `secret_ref_prefixes`, and an admin-scoped client sees every client's jobs and runs. **Write requests:** writes accept an `Idempotency-Key` header.
 
@@ -150,6 +150,10 @@ golangci-lint run ./...
 go test -race ./...
 DATA_DIR=$PWD/data go run ./cmd/plr serve   # also needs the required variables above
 ```
+
+**Updating Swagger UI:** run `scripts/vendor-swagger-ui.sh <version>` (it refuses releases under 14 days old; `--list-eligible` lists the allowed ones). Then add a `docsVendorSHA256[<version>]` `vendorPin` in `internal/web/web_test.go` with the two printed sha256 values, the `.sanitize(` call count and the DOMPurify version prefix, and drop the old entry. CI re-downloads the pinned tarball and compares it (`--verify`).
+
+The vendored Swagger UI is invisible to govulncheck and Dependabot. Before each release, and when GitHub announces a swagger-ui or DOMPurify advisory, check `gh api repos/swagger-api/swagger-ui/security-advisories` and the DOMPurify advisories for the bundled version, then re-vendor.
 
 ## Deploy
 
